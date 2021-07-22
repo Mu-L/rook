@@ -21,26 +21,28 @@ import (
 	"testing"
 
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
-	rookv1 "github.com/rook/rook/pkg/apis/rook.io/v1"
+	"github.com/rook/rook/pkg/apis/rook.io"
 	"github.com/rook/rook/pkg/clusterd"
-	"github.com/rook/rook/pkg/daemon/ceph/client"
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
 	"github.com/rook/rook/pkg/operator/ceph/cluster/osd/config"
 	opconfig "github.com/rook/rook/pkg/operator/ceph/config"
 	operatortest "github.com/rook/rook/pkg/operator/ceph/test"
 	cephver "github.com/rook/rook/pkg/operator/ceph/version"
+	"github.com/rook/rook/pkg/operator/k8sutil"
 	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
+	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/client-go/kubernetes/fake"
 )
 
 func TestPodContainer(t *testing.T) {
-	cluster := &Cluster{rookVersion: "23", clusterInfo: client.AdminClusterInfo("myosd")}
+	cluster := &Cluster{rookVersion: "23", clusterInfo: cephclient.AdminClusterInfo("myosd")}
+	cluster.clusterInfo.OwnerInfo = cephclient.NewMinimumOwnerInfo(t)
 	osdProps := osdProperties{
 		crushHostname: "node",
-		devices:       []rookv1.Device{},
+		devices:       []cephv1.Device{},
 		resources:     v1.ResourceRequirements{},
 		storeConfig:   config.StoreConfig{},
 		schedulerName: "custom-scheduler",
@@ -79,7 +81,7 @@ func TestDaemonset(t *testing.T) {
 }
 
 func testPodDevices(t *testing.T, dataDir, deviceName string, allDevices bool) {
-	devices := []rookv1.Device{
+	devices := []cephv1.Device{
 		{Name: deviceName},
 	}
 
@@ -89,17 +91,18 @@ func testPodDevices(t *testing.T, dataDir, deviceName string, allDevices bool) {
 		CephVersion: cephver.Nautilus,
 	}
 	clusterInfo.SetName("test")
+	clusterInfo.OwnerInfo = cephclient.NewMinimumOwnerInfo(t)
 	context := &clusterd.Context{Clientset: clientset, ConfigDir: "/var/lib/rook", Executor: &exectest.MockExecutor{}}
 	spec := cephv1.ClusterSpec{
 		CephVersion: cephv1.CephVersionSpec{Image: "ceph/ceph:v15"},
-		Storage: rookv1.StorageScopeSpec{
-			Selection: rookv1.Selection{UseAllDevices: &allDevices, DeviceFilter: deviceName},
-			Nodes:     []rookv1.Node{{Name: "node1"}},
+		Storage: cephv1.StorageScopeSpec{
+			Selection: cephv1.Selection{UseAllDevices: &allDevices, DeviceFilter: deviceName},
+			Nodes:     []cephv1.Node{{Name: "node1"}},
 		},
-		PriorityClassNames: map[rookv1.KeyType]string{
+		PriorityClassNames: map[rook.KeyType]string{
 			cephv1.KeyOSD: "my-priority-class",
 		},
-		Annotations: rookv1.AnnotationsSpec{
+		Annotations: cephv1.AnnotationsSpec{
 			"osd": map[string]string{
 				"TCMALLOC_MAX_TOTAL_THREAD_CACHE_BYTES": "134217728",
 			},
@@ -114,7 +117,8 @@ func testPodDevices(t *testing.T, dataDir, deviceName string, allDevices bool) {
 		return
 	}
 	osd := OSDInfo{
-		ID: 0,
+		ID:     0,
+		CVMode: "raw",
 	}
 
 	osdProp := osdProperties{
@@ -141,10 +145,10 @@ func testPodDevices(t *testing.T, dataDir, deviceName string, allDevices bool) {
 	assert.Equal(t, v1.RestartPolicyAlways, deployment.Spec.Template.Spec.RestartPolicy)
 	assert.Equal(t, "my-priority-class", deployment.Spec.Template.Spec.PriorityClassName)
 	if devMountNeeded && len(dataDir) > 0 {
-		assert.Equal(t, 7, len(deployment.Spec.Template.Spec.Volumes))
+		assert.Equal(t, 8, len(deployment.Spec.Template.Spec.Volumes))
 	}
 	if devMountNeeded && len(dataDir) == 0 {
-		assert.Equal(t, 7, len(deployment.Spec.Template.Spec.Volumes))
+		assert.Equal(t, 8, len(deployment.Spec.Template.Spec.Volumes))
 	}
 	if !devMountNeeded && len(dataDir) > 0 {
 		assert.Equal(t, 1, len(deployment.Spec.Template.Spec.Volumes))
@@ -162,7 +166,7 @@ func testPodDevices(t *testing.T, dataDir, deviceName string, allDevices bool) {
 	initCont := deployment.Spec.Template.Spec.InitContainers[0]
 	assert.Equal(t, "ceph/ceph:v15", initCont.Image)
 	assert.Equal(t, "activate", initCont.Name)
-	assert.Equal(t, 3, len(initCont.VolumeMounts))
+	assert.Equal(t, 4, len(initCont.VolumeMounts))
 
 	assert.Equal(t, 1, len(deployment.Spec.Template.Spec.Containers))
 	cont := deployment.Spec.Template.Spec.Containers[0]
@@ -199,7 +203,7 @@ func testPodDevices(t *testing.T, dataDir, deviceName string, allDevices bool) {
 	blkInitCont := deployment.Spec.Template.Spec.InitContainers[2]
 	assert.Equal(t, 1, len(blkInitCont.VolumeDevices))
 	cont = deployment.Spec.Template.Spec.Containers[0]
-	assert.Equal(t, 7, len(cont.VolumeMounts), cont.VolumeMounts)
+	assert.Equal(t, 8, len(cont.VolumeMounts), cont.VolumeMounts)
 
 	// Test OSD on PVC with RAW
 	osd = OSDInfo{
@@ -229,6 +233,8 @@ func testPodDevices(t *testing.T, dataDir, deviceName string, allDevices bool) {
 	assert.Equal(t, "blkdevmapper-encryption", deployment.Spec.Template.Spec.InitContainers[2].Name)
 	assert.Equal(t, "encrypted-block-status", deployment.Spec.Template.Spec.InitContainers[3].Name)
 	assert.Equal(t, "expand-encrypted-bluefs", deployment.Spec.Template.Spec.InitContainers[4].Name)
+	assert.Equal(t, 2, len(deployment.Spec.Template.Spec.InitContainers[4].VolumeMounts), deployment.Spec.Template.Spec.InitContainers[4].VolumeMounts)
+	assert.Equal(t, "dev-mapper", deployment.Spec.Template.Spec.InitContainers[4].VolumeMounts[1].Name, deployment.Spec.Template.Spec.InitContainers[4].VolumeMounts)
 	assert.Equal(t, "activate", deployment.Spec.Template.Spec.InitContainers[5].Name)
 	assert.Equal(t, "expand-bluefs", deployment.Spec.Template.Spec.InitContainers[6].Name)
 	assert.Equal(t, "chown-container-data-dir", deployment.Spec.Template.Spec.InitContainers[7].Name)
@@ -377,8 +383,7 @@ func testPodDevices(t *testing.T, dataDir, deviceName string, allDevices bool) {
 	assert.Equal(t, 1, len(deployment.Spec.Template.Spec.Containers))
 	cont = deployment.Spec.Template.Spec.Containers[0]
 	assert.Equal(t, 7, len(cont.VolumeMounts), cont.VolumeMounts)
-	assert.Equal(t, 10, len(deployment.Spec.Template.Spec.Volumes), deployment.Spec.Template.Spec.Volumes)                                     // One more than the encryption with k8s for the kek get init container
-	assert.Equal(t, 0, len(deployment.Spec.Template.Spec.Volumes[7].VolumeSource.Projected.Sources), deployment.Spec.Template.Spec.Volumes[0]) // 0 since we have no tls secrets
+	assert.Equal(t, 9, len(deployment.Spec.Template.Spec.Volumes), deployment.Spec.Template.Spec.Volumes) // One more than the encryption with k8s for the kek get init container
 
 	// Test with encrypted OSD on PVC with RAW with KMS with TLS
 	osdProp.encrypted = true
@@ -432,6 +437,7 @@ func testPodDevices(t *testing.T, dataDir, deviceName string, allDevices bool) {
 			CephVersion: cephver.Octopus,
 		}
 		clusterInfo.SetName("test")
+		clusterInfo.OwnerInfo = cephclient.NewMinimumOwnerInfo(t)
 		c := New(context, clusterInfo, spec, "rook/rook:myversion")
 		deployment, err = c.makeDeployment(osdProp, osd, dataPathMap)
 		assert.NoError(t, err)
@@ -467,14 +473,15 @@ func TestStorageSpecConfig(t *testing.T) {
 		CephVersion: cephver.Nautilus,
 	}
 	clusterInfo.SetName("testing")
+	clusterInfo.OwnerInfo = cephclient.NewMinimumOwnerInfo(t)
 	context := &clusterd.Context{Clientset: clientset, ConfigDir: "/var/lib/rook", Executor: &exectest.MockExecutor{}}
 	spec := cephv1.ClusterSpec{
 		DataDirHostPath: context.ConfigDir,
-		Storage: rookv1.StorageScopeSpec{
+		Storage: cephv1.StorageScopeSpec{
 			Config: map[string]string{
 				"crushRoot": "custom-root",
 			},
-			Nodes: []rookv1.Node{
+			Nodes: []cephv1.Node{
 				{
 					Name: "node1",
 					Config: map[string]string{
@@ -482,7 +489,7 @@ func TestStorageSpecConfig(t *testing.T) {
 						"walSizeMB":      "20",
 						"metadataDevice": "nvme093",
 					},
-					Selection: rookv1.Selection{},
+					Selection: cephv1.Selection{},
 					Resources: v1.ResourceRequirements{
 						Limits: v1.ResourceList{
 							v1.ResourceCPU:    *resource.NewQuantity(1024.0, resource.BinarySI),
@@ -531,8 +538,8 @@ func TestStorageSpecConfig(t *testing.T) {
 }
 
 func TestHostNetwork(t *testing.T) {
-	storageSpec := rookv1.StorageScopeSpec{
-		Nodes: []rookv1.Node{
+	storageSpec := cephv1.StorageScopeSpec{
+		Nodes: []cephv1.Node{
 			{
 				Name: "node1",
 				Config: map[string]string{
@@ -549,6 +556,8 @@ func TestHostNetwork(t *testing.T) {
 		CephVersion: cephver.Nautilus,
 	}
 	clusterInfo.SetName("test")
+
+	clusterInfo.OwnerInfo = cephclient.NewMinimumOwnerInfo(t)
 	context := &clusterd.Context{Clientset: clientset, ConfigDir: "/var/lib/rook", Executor: &exectest.MockExecutor{}}
 	spec := cephv1.ClusterSpec{
 		Storage: storageSpec,
@@ -558,7 +567,8 @@ func TestHostNetwork(t *testing.T) {
 
 	n := c.spec.Storage.ResolveNode(storageSpec.Nodes[0].Name)
 	osd := OSDInfo{
-		ID: 0,
+		ID:     0,
+		CVMode: "raw",
 	}
 
 	osdProp := osdProperties{
@@ -588,6 +598,7 @@ func TestOsdPrepareResources(t *testing.T) {
 	context := &clusterd.Context{Clientset: clientset, ConfigDir: "/var/lib/rook", Executor: &exectest.MockExecutor{}}
 	clusterInfo := &cephclient.ClusterInfo{Namespace: "ns"}
 	clusterInfo.SetName("test")
+	clusterInfo.OwnerInfo = cephclient.NewMinimumOwnerInfo(t)
 	spec := cephv1.ClusterSpec{
 		Resources: map[string]v1.ResourceRequirements{"prepareosd": {
 			Limits: v1.ResourceList{
@@ -609,7 +620,7 @@ func TestOsdPrepareResources(t *testing.T) {
 }
 
 func TestClusterGetPVCEncryptionOpenInitContainerActivate(t *testing.T) {
-	c := New(&clusterd.Context{}, &cephclient.ClusterInfo{}, cephv1.ClusterSpec{}, "rook/rook:myversion")
+	c := New(&clusterd.Context{}, &cephclient.ClusterInfo{OwnerInfo: &k8sutil.OwnerInfo{}}, cephv1.ClusterSpec{}, "rook/rook:myversion")
 	osdProperties := osdProperties{
 		pvc: v1.PersistentVolumeClaimVolumeSource{
 			ClaimName: "pvc1",
@@ -633,7 +644,7 @@ func TestClusterGetPVCEncryptionOpenInitContainerActivate(t *testing.T) {
 }
 
 func TestClusterGetPVCEncryptionInitContainerActivate(t *testing.T) {
-	c := New(&clusterd.Context{}, &cephclient.ClusterInfo{}, cephv1.ClusterSpec{}, "rook/rook:myversion")
+	c := New(&clusterd.Context{}, &cephclient.ClusterInfo{OwnerInfo: &k8sutil.OwnerInfo{}}, cephv1.ClusterSpec{}, "rook/rook:myversion")
 	osdProperties := osdProperties{
 		pvc: v1.PersistentVolumeClaimVolumeSource{
 			ClaimName: "pvc1",
@@ -655,4 +666,44 @@ func TestClusterGetPVCEncryptionInitContainerActivate(t *testing.T) {
 	osdProperties.walPVC.ClaimName = "pvcWal"
 	containers = c.getPVCEncryptionInitContainerActivate(mountPath, osdProperties)
 	assert.Equal(t, 3, len(containers))
+}
+
+// WARNING! modifies c.deviceSets
+func getDummyDeploymentOnPVC(clientset *fake.Clientset, c *Cluster, pvcName string, osdID int) *appsv1.Deployment {
+	osd := OSDInfo{
+		ID:        osdID,
+		UUID:      "some-uuid",
+		BlockPath: "/some/path",
+		CVMode:    "raw",
+	}
+	c.deviceSets = append(c.deviceSets, deviceSet{
+		Name: pvcName,
+		PVCSources: map[string]v1.PersistentVolumeClaimVolumeSource{
+			bluestorePVCData: {ClaimName: pvcName},
+		},
+		Portable: true,
+	})
+	config := c.newProvisionConfig()
+	d, err := deploymentOnPVC(c, osd, pvcName, config)
+	if err != nil {
+		panic(err)
+	}
+	return d
+}
+
+// WARNING! modifies c.ValidStorage
+func getDummyDeploymentOnNode(clientset *fake.Clientset, c *Cluster, nodeName string, osdID int) *appsv1.Deployment {
+	osd := OSDInfo{
+		ID:        osdID,
+		UUID:      "some-uuid",
+		BlockPath: "/dev/vda",
+		CVMode:    "raw",
+	}
+	c.ValidStorage.Nodes = append(c.ValidStorage.Nodes, cephv1.Node{Name: nodeName})
+	config := c.newProvisionConfig()
+	d, err := deploymentOnNode(c, osd, nodeName, config)
+	if err != nil {
+		panic(err)
+	}
+	return d
 }

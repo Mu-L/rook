@@ -29,7 +29,6 @@ import (
 	"github.com/pkg/errors"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/clusterd"
-	"github.com/rook/rook/pkg/daemon/ceph/client"
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
 	"github.com/rook/rook/pkg/operator/ceph/cluster/mon"
 	"github.com/rook/rook/pkg/operator/ceph/config"
@@ -182,10 +181,20 @@ func (c *Cluster) Start() error {
 	// check if any extra mgrs need to be removed
 	c.removeExtraMgrs(daemonIDs)
 
-	if len(daemonIDs) == 1 {
-		// Only reconcile the mgr services in the operator if there is a single mgr.
-		// If there are multiple mgrs they will be managed by the mgr sidecar.
-		if err := c.reconcileService(daemonIDs[0]); err != nil {
+	activeMgr := daemonIDs[0]
+	if len(daemonIDs) > 1 {
+		// When multiple mgrs are running, the mgr sidecar for the active mgr
+		// will create the services. However, the sidecar will only reconcile all
+		// the services when the active mgr changes. Here as part of the regular reconcile
+		// we trigger reconciling all the services to ensure they are current.
+		activeMgr, err = c.getActiveMgr()
+		if err != nil || activeMgr == "" {
+			activeMgr = ""
+			logger.Infof("cannot reconcile mgr services, no active mgr found. err=%v", err)
+		}
+	}
+	if activeMgr != "" {
+		if err := c.reconcileServices(activeMgr); err != nil {
 			return errors.Wrap(err, "failed to enable mgr services")
 		}
 	}
@@ -224,9 +233,9 @@ func (c *Cluster) removeExtraMgrs(daemonIDs []string) {
 	}
 }
 
-// ReconcileMultipleServices reconciles the services if the active mgr is the one running
+// ReconcileActiveMgrServices reconciles the services if the active mgr is the one running
 // in the sidecar
-func (c *Cluster) ReconcileMultipleServices(daemonNameToUpdate string, mgrStatSupported bool) error {
+func (c *Cluster) ReconcileActiveMgrServices(daemonNameToUpdate string) error {
 	// If the services are already set to this daemon, no need to attempt to update
 	svc, err := c.context.Clientset.CoreV1().Services(c.clusterInfo.Namespace).Get(context.TODO(), AppName, metav1.GetOptions{})
 	if err != nil {
@@ -240,23 +249,9 @@ func (c *Cluster) ReconcileMultipleServices(daemonNameToUpdate string, mgrStatSu
 		logger.Infof("mgr service currently set to %q, checking if need to update to %q", currentDaemon, daemonNameToUpdate)
 	}
 
-	var activeName string
-	// mgrStatSupported is a flag instead of calling c.clusterInfo.CephVersion.IsAtLeastPacific() directly since we're inside the sidecar
-	// where the cephVersion is not directly available
-	if mgrStatSupported {
-		// The preferred way to query the active mgr is "ceph mgr stat", which is only available in pacific
-		mgrStat, err := cephclient.CephMgrStat(c.context, c.clusterInfo)
-		if err != nil {
-			return errors.Wrap(err, "failed to get mgr stat for the active mgr")
-		}
-		activeName = mgrStat.ActiveName
-	} else {
-		// The legacy way to query the active mgr is with the verbose "ceph mgr dump"
-		mgrMap, err := cephclient.CephMgrMap(c.context, c.clusterInfo)
-		if err != nil {
-			return errors.Wrap(err, "failed to get mgr map for the active mgr")
-		}
-		activeName = mgrMap.ActiveName
+	activeName, err := c.getActiveMgr()
+	if err != nil {
+		return err
 	}
 	if activeName == "" {
 		return errors.New("active mgr not found")
@@ -266,11 +261,30 @@ func (c *Cluster) ReconcileMultipleServices(daemonNameToUpdate string, mgrStatSu
 		return nil
 	}
 
-	return c.reconcileService(activeName)
+	return c.reconcileServices(activeName)
+}
+
+func (c *Cluster) getActiveMgr() (string, error) {
+	// The preferred way to query the active mgr is "ceph mgr stat", which is only available in pacific or newer
+	if c.clusterInfo.CephVersion.IsAtLeastPacific() {
+		mgrStat, err := cephclient.CephMgrStat(c.context, c.clusterInfo)
+		if err != nil {
+			return "", errors.Wrap(err, "failed to get mgr stat for the active mgr")
+		}
+		return mgrStat.ActiveName, nil
+	}
+
+	// The legacy way to query the active mgr is with the verbose "ceph mgr dump"
+	mgrMap, err := cephclient.CephMgrMap(c.context, c.clusterInfo)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to get mgr map for the active mgr")
+	}
+
+	return mgrMap.ActiveName, nil
 }
 
 // reconcile the services, if the active mgr is not detected, use the default mgr
-func (c *Cluster) reconcileService(activeDaemon string) error {
+func (c *Cluster) reconcileServices(activeDaemon string) error {
 	logger.Infof("setting services to point to mgr %q", activeDaemon)
 
 	if err := c.configureDashboardService(activeDaemon); err != nil {
@@ -278,7 +292,10 @@ func (c *Cluster) reconcileService(activeDaemon string) error {
 	}
 
 	// create the metrics service
-	service := c.MakeMetricsService(AppName, activeDaemon, serviceMetricName)
+	service, err := c.MakeMetricsService(AppName, activeDaemon, serviceMetricName)
+	if err != nil {
+		return err
+	}
 	if _, err := k8sutil.CreateOrUpdateService(c.context.Clientset, c.clusterInfo.Namespace, service); err != nil {
 		return errors.Wrap(err, "failed to create mgr metrics service")
 	}
@@ -322,7 +339,7 @@ func startModuleConfiguration(description string, configureModules func() error)
 
 // Ceph docs about the prometheus module: http://docs.ceph.com/docs/master/mgr/prometheus/
 func (c *Cluster) enablePrometheusModule() error {
-	if err := client.MgrEnableModule(c.context, c.clusterInfo, PrometheusModuleName, true); err != nil {
+	if err := cephclient.MgrEnableModule(c.context, c.clusterInfo, PrometheusModuleName, true); err != nil {
 		return errors.Wrap(err, "failed to enable mgr prometheus module")
 	}
 	return nil
@@ -330,7 +347,7 @@ func (c *Cluster) enablePrometheusModule() error {
 
 // Ceph docs about the crash module: https://docs.ceph.com/docs/master/mgr/crash/
 func (c *Cluster) enableCrashModule() error {
-	if err := client.MgrEnableModule(c.context, c.clusterInfo, crashModuleName, true); err != nil {
+	if err := cephclient.MgrEnableModule(c.context, c.clusterInfo, crashModuleName, true); err != nil {
 		return errors.Wrap(err, "failed to enable mgr crash module")
 	}
 	return nil
@@ -340,13 +357,13 @@ func (c *Cluster) enableBalancerModule() error {
 	// The order MATTERS, always configure this module first, then turn it on
 
 	// This sets min compat client to luminous and the balancer module mode
-	err := client.ConfigureBalancerModule(c.context, c.clusterInfo, balancerModuleMode)
+	err := cephclient.ConfigureBalancerModule(c.context, c.clusterInfo, balancerModuleMode)
 	if err != nil {
 		return errors.Wrapf(err, "failed to configure module %q", balancerModuleName)
 	}
 
 	// This turns "on" the balancer
-	err = client.MgrEnableModule(c.context, c.clusterInfo, balancerModuleName, false)
+	err = cephclient.MgrEnableModule(c.context, c.clusterInfo, balancerModuleName, false)
 	if err != nil {
 		return errors.Wrapf(err, "failed to turn on mgr %q module", balancerModuleName)
 	}
@@ -371,13 +388,13 @@ func (c *Cluster) configureMgrModules() error {
 		if module.Enabled {
 			if module.Name == balancerModuleName {
 				// Configure balancer module mode
-				err := client.ConfigureBalancerModule(c.context, c.clusterInfo, balancerModuleMode)
+				err := cephclient.ConfigureBalancerModule(c.context, c.clusterInfo, balancerModuleMode)
 				if err != nil {
 					return errors.Wrapf(err, "failed to configure module %q", module.Name)
 				}
 			}
 
-			if err := client.MgrEnableModule(c.context, c.clusterInfo, module.Name, false); err != nil {
+			if err := cephclient.MgrEnableModule(c.context, c.clusterInfo, module.Name, false); err != nil {
 				return errors.Wrapf(err, "failed to enable mgr module %q", module.Name)
 			}
 
@@ -399,7 +416,7 @@ func (c *Cluster) configureMgrModules() error {
 			}
 
 		} else {
-			if err := client.MgrDisableModule(c.context, c.clusterInfo, module.Name); err != nil {
+			if err := cephclient.MgrDisableModule(c.context, c.clusterInfo, module.Name); err != nil {
 				return errors.Wrapf(err, "failed to disable mgr module %q", module.Name)
 			}
 		}
@@ -439,13 +456,18 @@ func (c *Cluster) EnableServiceMonitor(activeDaemon string) error {
 	}
 	serviceMonitor.SetName(AppName)
 	serviceMonitor.SetNamespace(c.clusterInfo.Namespace)
+	cephv1.GetMonitoringLabels(c.spec.Labels).ApplyToObjectMeta(&serviceMonitor.ObjectMeta)
+
 	if c.spec.External.Enable {
-		serviceMonitor.Spec.Endpoints[0].Port = ServiceExternalMetricName
+		serviceMonitor.Spec.Endpoints[0].Port = controller.ServiceExternalMetricName
 	}
-	k8sutil.SetOwnerRef(&serviceMonitor.ObjectMeta, &c.clusterInfo.OwnerRef)
+	err = c.clusterInfo.OwnerInfo.SetControllerReference(serviceMonitor)
+	if err != nil {
+		return errors.Wrapf(err, "failed to set owner reference to service monitor %q", serviceMonitor.Name)
+	}
 	serviceMonitor.Spec.NamespaceSelector.MatchNames = []string{c.clusterInfo.Namespace}
 	serviceMonitor.Spec.Selector.MatchLabels = c.selectorLabels(activeDaemon)
-	if _, err := k8sutil.CreateOrUpdateServiceMonitor(serviceMonitor); err != nil {
+	if _, err = k8sutil.CreateOrUpdateServiceMonitor(serviceMonitor); err != nil {
 		return errors.Wrap(err, "service monitor could not be enabled")
 	}
 	return nil
@@ -463,8 +485,11 @@ func (c *Cluster) DeployPrometheusRule(name, namespace string) error {
 	}
 	prometheusRule.SetName(name)
 	prometheusRule.SetNamespace(namespace)
-	owners := append(prometheusRule.GetOwnerReferences(), c.clusterInfo.OwnerRef)
-	k8sutil.SetOwnerRefs(&prometheusRule.ObjectMeta, owners)
+	err = c.clusterInfo.OwnerInfo.SetControllerReference(prometheusRule)
+	if err != nil {
+		return errors.Wrapf(err, "failed to set owner reference to prometheus rule %q", prometheusRule.Name)
+	}
+	cephv1.GetMonitoringLabels(c.spec.Labels).ApplyToObjectMeta(&prometheusRule.ObjectMeta)
 	if _, err := k8sutil.CreateOrUpdatePrometheusRule(prometheusRule); err != nil {
 		return errors.Wrap(err, "prometheus rule could not be deployed")
 	}

@@ -28,7 +28,7 @@ import (
 
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/clusterd"
-	"github.com/rook/rook/pkg/daemon/ceph/client"
+	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
 	clienttest "github.com/rook/rook/pkg/daemon/ceph/client/test"
 	"github.com/rook/rook/pkg/operator/ceph/config"
 	testopk8s "github.com/rook/rook/pkg/operator/k8sutil/test"
@@ -40,6 +40,7 @@ import (
 	apps "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 )
 
 func TestCheckHealth(t *testing.T) {
@@ -61,7 +62,8 @@ func TestCheckHealth(t *testing.T) {
 		Executor:                   executor,
 		RequestCancelOrchestration: abool.New(),
 	}
-	c := New(context, "ns", cephv1.ClusterSpec{}, metav1.OwnerReference{}, &sync.Mutex{})
+	ownerInfo := cephclient.NewMinimumOwnerInfoWithOwnerRef()
+	c := New(context, "ns", cephv1.ClusterSpec{}, ownerInfo, &sync.Mutex{})
 	// clusterInfo is nil so we return err
 	err := c.checkHealth()
 	assert.NotNil(t, err)
@@ -148,11 +150,68 @@ func TestCheckHealth(t *testing.T) {
 	}
 }
 
+func TestEvictMonOnSameNode(t *testing.T) {
+	ctx := context.TODO()
+	clientset := test.New(t, 1)
+	configDir, _ := ioutil.TempDir("", "")
+	defer os.RemoveAll(configDir)
+	context := &clusterd.Context{Clientset: clientset, ConfigDir: configDir, Executor: &exectest.MockExecutor{}, RequestCancelOrchestration: abool.New()}
+	ownerInfo := cephclient.NewMinimumOwnerInfoWithOwnerRef()
+	c := New(context, "ns", cephv1.ClusterSpec{}, ownerInfo, &sync.Mutex{})
+	setCommonMonProperties(c, 1, cephv1.MonSpec{Count: 0}, "myversion")
+	c.maxMonID = 2
+	c.waitForStart = false
+	waitForMonitorScheduling = func(c *Cluster, d *apps.Deployment) (SchedulingResult, error) {
+		node, _ := clientset.CoreV1().Nodes().Get(ctx, "node0", metav1.GetOptions{})
+		return SchedulingResult{Node: node}, nil
+	}
+
+	c.spec.Mon.Count = 3
+	createTestMonPod(t, clientset, c, "a", "node1")
+
+	// Nothing to evict with a single mon
+	err := c.evictMonIfMultipleOnSameNode()
+	assert.NoError(t, err)
+
+	// Create a second mon on a different node
+	createTestMonPod(t, clientset, c, "b", "node2")
+
+	// Nothing to evict with where mons are on different nodes
+	err = c.evictMonIfMultipleOnSameNode()
+	assert.NoError(t, err)
+
+	// Create a third mon on the same node as mon a
+	createTestMonPod(t, clientset, c, "c", "node1")
+	assert.Equal(t, 2, c.maxMonID)
+
+	// Should evict either mon a or mon c since they are on the same node and failover to mon d
+	err = c.evictMonIfMultipleOnSameNode()
+	assert.NoError(t, err)
+	_, err = clientset.AppsV1().Deployments(c.Namespace).Get(ctx, "rook-ceph-mon-d", metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Equal(t, 3, c.maxMonID)
+}
+
+func createTestMonPod(t *testing.T, clientset kubernetes.Interface, c *Cluster, name, node string) {
+	m := &monConfig{ResourceName: resourceName(name), DaemonName: name, DataPathMap: &config.DataPathMap{}}
+	d, err := c.makeDeployment(m, false)
+	assert.NoError(t, err)
+	monPod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "mon-pod-" + name, Namespace: c.Namespace, Labels: d.Labels},
+		Spec:       d.Spec.Template.Spec,
+	}
+	monPod.Spec.NodeName = node
+	monPod.Status.Phase = v1.PodRunning
+	_, err = clientset.CoreV1().Pods(c.Namespace).Create(context.TODO(), monPod, metav1.CreateOptions{})
+	assert.NoError(t, err)
+}
+
 func TestScaleMonDeployment(t *testing.T) {
 	ctx := context.TODO()
 	clientset := test.New(t, 1)
 	context := &clusterd.Context{Clientset: clientset}
-	c := New(context, "ns", cephv1.ClusterSpec{}, metav1.OwnerReference{}, &sync.Mutex{})
+	ownerInfo := cephclient.NewMinimumOwnerInfoWithOwnerRef()
+	c := New(context, "ns", cephv1.ClusterSpec{}, ownerInfo, &sync.Mutex{})
 	setCommonMonProperties(c, 1, cephv1.MonSpec{Count: 0, AllowMultiplePerNode: true}, "myversion")
 
 	name := "a"
@@ -199,7 +258,8 @@ func TestCheckHealthNotFound(t *testing.T) {
 		Executor:                   executor,
 		RequestCancelOrchestration: abool.New(),
 	}
-	c := New(context, "ns", cephv1.ClusterSpec{}, metav1.OwnerReference{}, &sync.Mutex{})
+	ownerInfo := cephclient.NewMinimumOwnerInfoWithOwnerRef()
+	c := New(context, "ns", cephv1.ClusterSpec{}, ownerInfo, &sync.Mutex{})
 	setCommonMonProperties(c, 2, cephv1.MonSpec{Count: 3, AllowMultiplePerNode: true}, "myversion")
 	c.waitForStart = false
 	defer os.RemoveAll(c.context.ConfigDir)
@@ -257,7 +317,8 @@ func TestAddRemoveMons(t *testing.T) {
 		Executor:                   executor,
 		RequestCancelOrchestration: abool.New(),
 	}
-	c := New(context, "ns", cephv1.ClusterSpec{}, metav1.OwnerReference{}, &sync.Mutex{})
+	ownerInfo := cephclient.NewMinimumOwnerInfoWithOwnerRef()
+	c := New(context, "ns", cephv1.ClusterSpec{}, ownerInfo, &sync.Mutex{})
 	setCommonMonProperties(c, 0, cephv1.MonSpec{Count: 5, AllowMultiplePerNode: true}, "myversion")
 	c.maxMonID = 0 // "a" is max mon id
 	c.waitForStart = false
@@ -320,9 +381,9 @@ func TestAddOrRemoveExternalMonitor(t *testing.T) {
 	var err error
 
 	// populate fake monmap
-	fakeResp := client.MonStatusResponse{Quorum: []int{0}}
+	fakeResp := cephclient.MonStatusResponse{Quorum: []int{0}}
 
-	fakeResp.MonMap.Mons = []client.MonMapEntry{
+	fakeResp.MonMap.Mons = []cephclient.MonMapEntry{
 		{
 			Name: "a",
 		},
@@ -330,7 +391,7 @@ func TestAddOrRemoveExternalMonitor(t *testing.T) {
 	fakeResp.MonMap.Mons[0].PublicAddr = "172.17.0.4:3300"
 
 	// populate fake ClusterInfo
-	c := &Cluster{ClusterInfo: &client.ClusterInfo{}}
+	c := &Cluster{ClusterInfo: &cephclient.ClusterInfo{}}
 	c.ClusterInfo = clienttest.CreateTestClusterInfo(1)
 
 	//
@@ -360,7 +421,7 @@ func TestAddOrRemoveExternalMonitor(t *testing.T) {
 	//
 	// Now let's add a new mon in the external cluster
 	// ClusterInfo should be updated with this new monitor
-	fakeResp.MonMap.Mons = []client.MonMapEntry{
+	fakeResp.MonMap.Mons = []cephclient.MonMapEntry{
 		{
 			Name: "a",
 		},
@@ -380,7 +441,7 @@ func TestAddOrRemoveExternalMonitor(t *testing.T) {
 func TestNewHealthChecker(t *testing.T) {
 	c := &Cluster{spec: cephv1.ClusterSpec{HealthCheck: cephv1.CephClusterHealthCheckSpec{}}}
 	time10s, _ := time.ParseDuration("10s")
-	c10s := &Cluster{spec: cephv1.ClusterSpec{HealthCheck: cephv1.CephClusterHealthCheckSpec{DaemonHealth: cephv1.DaemonHealthSpec{Monitor: cephv1.HealthCheckSpec{Interval: "10s"}}}}}
+	c10s := &Cluster{spec: cephv1.ClusterSpec{HealthCheck: cephv1.CephClusterHealthCheckSpec{DaemonHealth: cephv1.DaemonHealthSpec{Monitor: cephv1.HealthCheckSpec{Interval: &metav1.Duration{Duration: time10s}}}}}}
 
 	type args struct {
 		monCluster *Cluster

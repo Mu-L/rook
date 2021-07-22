@@ -25,11 +25,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pkg/errors"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/clusterd"
-	"github.com/rook/rook/pkg/daemon/ceph/client"
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
 	optest "github.com/rook/rook/pkg/operator/test"
+	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
 	v1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
@@ -127,7 +128,7 @@ func TestCephStatus(t *testing.T) {
 }
 
 func TestNewCephStatusChecker(t *testing.T) {
-	clusterInfo := client.AdminClusterInfo("ns")
+	clusterInfo := cephclient.AdminClusterInfo("ns")
 	c := &clusterd.Context{}
 	time10s, err := time.ParseDuration("10s")
 	assert.NoError(t, err)
@@ -142,9 +143,9 @@ func TestNewCephStatusChecker(t *testing.T) {
 		args args
 		want *cephStatusChecker
 	}{
-		{"default-interval", args{c, clusterInfo, &cephv1.ClusterSpec{}}, &cephStatusChecker{c, clusterInfo, defaultStatusCheckInterval, c.Client, false}},
-		{"10s-interval", args{c, clusterInfo, &cephv1.ClusterSpec{HealthCheck: cephv1.CephClusterHealthCheckSpec{DaemonHealth: cephv1.DaemonHealthSpec{Status: cephv1.HealthCheckSpec{Interval: "10s"}}}}}, &cephStatusChecker{c, clusterInfo, time10s, c.Client, false}},
-		{"10s-interval-external", args{c, clusterInfo, &cephv1.ClusterSpec{External: cephv1.ExternalSpec{Enable: true}, HealthCheck: cephv1.CephClusterHealthCheckSpec{DaemonHealth: cephv1.DaemonHealthSpec{Status: cephv1.HealthCheckSpec{Interval: "10s"}}}}}, &cephStatusChecker{c, clusterInfo, time10s, c.Client, true}},
+		{"default-interval", args{c, clusterInfo, &cephv1.ClusterSpec{}}, &cephStatusChecker{c, clusterInfo, &defaultStatusCheckInterval, c.Client, false}},
+		{"10s-interval", args{c, clusterInfo, &cephv1.ClusterSpec{HealthCheck: cephv1.CephClusterHealthCheckSpec{DaemonHealth: cephv1.DaemonHealthSpec{Status: cephv1.HealthCheckSpec{Interval: &metav1.Duration{Duration: time10s}}}}}}, &cephStatusChecker{c, clusterInfo, &time10s, c.Client, false}},
+		{"10s-interval-external", args{c, clusterInfo, &cephv1.ClusterSpec{External: cephv1.ExternalSpec{Enable: true}, HealthCheck: cephv1.CephClusterHealthCheckSpec{DaemonHealth: cephv1.DaemonHealthSpec{Status: cephv1.HealthCheckSpec{Interval: &metav1.Duration{Duration: time10s}}}}}}, &cephStatusChecker{c, clusterInfo, &time10s, c.Client, true}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -155,10 +156,101 @@ func TestNewCephStatusChecker(t *testing.T) {
 	}
 }
 
+func TestConfigureHealthSettings(t *testing.T) {
+	c := &cephStatusChecker{
+		context:     &clusterd.Context{},
+		clusterInfo: cephclient.AdminClusterInfo("ns"),
+	}
+	getGlobalIDReclaim := false
+	setGlobalIDReclaim := false
+	c.context.Executor = &exectest.MockExecutor{
+		MockExecuteCommandWithOutputFile: func(command, outfile string, args ...string) (string, error) {
+			logger.Infof("Command: %s %v", command, args)
+			if args[0] == "config" && args[3] == "auth_allow_insecure_global_id_reclaim" {
+				if args[1] == "get" {
+					getGlobalIDReclaim = true
+					return "", nil
+				}
+				if args[1] == "set" {
+					setGlobalIDReclaim = true
+					return "", nil
+				}
+			}
+			return "", errors.New("mock error to simulate failure of SetConfig() function")
+		},
+	}
+	noActionOneWarningStatus := cephclient.CephStatus{
+		Health: cephclient.HealthStatus{
+			Checks: map[string]cephclient.CheckMessage{
+				"MDS_ALL_DOWN": {
+					Severity: "HEALTH_WARN",
+					Summary: cephclient.Summary{
+						Message: "MDS_ALL_DOWN",
+					},
+				},
+			},
+		},
+	}
+	disableInsecureGlobalIDStatus := cephclient.CephStatus{
+		Health: cephclient.HealthStatus{
+			Checks: map[string]cephclient.CheckMessage{
+				"AUTH_INSECURE_GLOBAL_ID_RECLAIM_ALLOWED": {
+					Severity: "HEALTH_WARN",
+					Summary: cephclient.Summary{
+						Message: "foo",
+					},
+				},
+			},
+		},
+	}
+	noDisableInsecureGlobalIDStatus := cephclient.CephStatus{
+		Health: cephclient.HealthStatus{
+			Checks: map[string]cephclient.CheckMessage{
+				"AUTH_INSECURE_GLOBAL_ID_RECLAIM_ALLOWED": {
+					Severity: "HEALTH_WARN",
+					Summary: cephclient.Summary{
+						Message: "foo",
+					},
+				},
+				"AUTH_INSECURE_GLOBAL_ID_RECLAIM": {
+					Severity: "HEALTH_WARN",
+					Summary: cephclient.Summary{
+						Message: "bar",
+					},
+				},
+			},
+		},
+	}
+
+	type args struct {
+		status                     cephclient.CephStatus
+		expectedGetGlobalIDSetting bool
+		expectedSetGlobalIDSetting bool
+	}
+	tests := []struct {
+		name string
+		args args
+	}{
+		{"no-warnings", args{cephclient.CephStatus{}, false, false}},
+		{"no-action-one-warning", args{noActionOneWarningStatus, false, false}},
+		{"disable-insecure-global-id", args{disableInsecureGlobalIDStatus, true, true}},
+		{"no-disable-insecure-global-id", args{noDisableInsecureGlobalIDStatus, false, false}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			getGlobalIDReclaim = false
+			setGlobalIDReclaim = false
+			c.configureHealthSettings(tt.args.status)
+			assert.Equal(t, tt.args.expectedGetGlobalIDSetting, getGlobalIDReclaim)
+			assert.Equal(t, tt.args.expectedSetGlobalIDSetting, setGlobalIDReclaim)
+		})
+	}
+}
+
 func TestForceDeleteStuckRookPodsOnNotReadyNodes(t *testing.T) {
 	ctx := context.TODO()
 	clientset := optest.New(t, 1)
-	clusterInfo := client.NewClusterInfo("test", "test")
+	clusterInfo := cephclient.NewClusterInfo("test", "test")
 	clusterName := clusterInfo.NamespacedName()
 
 	context := &clusterd.Context{
@@ -229,7 +321,7 @@ func TestForceDeleteStuckRookPodsOnNotReadyNodes(t *testing.T) {
 func TestGetRookPodsOnNode(t *testing.T) {
 	ctx := context.TODO()
 	clientset := optest.New(t, 1)
-	clusterInfo := client.NewClusterInfo("test", "test")
+	clusterInfo := cephclient.NewClusterInfo("test", "test")
 	clusterName := clusterInfo.NamespacedName()
 	context := &clusterd.Context{
 		Clientset: clientset,
@@ -246,6 +338,7 @@ func TestGetRookPodsOnNode(t *testing.T) {
 		{"app": "rook-ceph-crashcollector"},
 		{"app": "rook-ceph-mgr"},
 		{"app": "rook-ceph-mds"},
+		{"app": "rook-ceph-rgw"},
 		{"app": "user-app"},
 		{"app": "rook-ceph-mon"},
 	}
@@ -275,7 +368,7 @@ func TestGetRookPodsOnNode(t *testing.T) {
 	pods, err := c.getRookPodsOnNode("node0")
 	assert.NoError(t, err)
 	// A pod is having two matching labels and its returned only once
-	assert.Equal(t, 10, len(pods))
+	assert.Equal(t, 11, len(pods))
 
 	podNames := []string{}
 	for _, pod := range pods {

@@ -47,9 +47,6 @@ func init() {
 	operatorCmd.Flags().DurationVar(&mon.HealthCheckInterval, "mon-healthcheck-interval", mon.HealthCheckInterval, "mon health check interval (duration)")
 	operatorCmd.Flags().DurationVar(&mon.MonOutTimeout, "mon-out-timeout", mon.MonOutTimeout, "mon out timeout (duration)")
 
-	operatorCmd.Flags().BoolVar(&operator.EnableFlexDriver, "enable-flex-driver", true, "enable the rook flex driver")
-	operatorCmd.Flags().BoolVar(&operator.EnableDiscoveryDaemon, "enable-discovery-daemon", false, "enable the rook discovery daemon")
-
 	// csi deployment templates
 	operatorCmd.Flags().StringVar(&csi.RBDPluginTemplatePath, "csi-rbd-plugin-template-path", csi.DefaultRBDPluginTemplatePath, "path to ceph-csi rbd plugin template")
 
@@ -80,6 +77,7 @@ func startOperator(cmd *cobra.Command, args []string) error {
 		rook.TerminateFatal(err)
 	}
 
+	rook.CheckOperatorResources(context.Clientset)
 	rookImage := rook.GetOperatorImage(context.Clientset, containerName)
 	rookBaseImageCephVersion, err := rook.GetOperatorBaseImageCephVersion(context)
 	if err != nil {

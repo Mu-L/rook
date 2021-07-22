@@ -23,7 +23,6 @@ import (
 	"github.com/pkg/errors"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/clusterd"
-	"github.com/rook/rook/pkg/daemon/ceph/client"
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
 	cephver "github.com/rook/rook/pkg/operator/ceph/version"
 	"github.com/rook/rook/pkg/operator/test"
@@ -53,7 +52,8 @@ func TestGeneratePassword(t *testing.T) {
 func TestGetOrGeneratePassword(t *testing.T) {
 	ctx := context.TODO()
 	clientset := test.New(t, 3)
-	clusterInfo := &client.ClusterInfo{Namespace: "myns"}
+	ownerInfo := cephclient.NewMinimumOwnerInfoWithOwnerRef()
+	clusterInfo := &cephclient.ClusterInfo{Namespace: "myns", OwnerInfo: ownerInfo}
 	c := &Cluster{context: &clusterd.Context{Clientset: clientset}, clusterInfo: clusterInfo}
 	_, err := c.context.Clientset.CoreV1().Secrets(clusterInfo.Namespace).Get(ctx, dashboardPasswordName, metav1.GetOptions{})
 	assert.True(t, kerrors.IsNotFound(err))
@@ -109,9 +109,11 @@ func TestStartSecureDashboard(t *testing.T) {
 		return executor.MockExecuteCommandWithOutputFile(command, outfileArg, arg...)
 	}
 
+	ownerInfo := cephclient.NewMinimumOwnerInfoWithOwnerRef()
 	clusterInfo := &cephclient.ClusterInfo{
 		Namespace:   "myns",
 		CephVersion: cephver.Nautilus,
+		OwnerInfo:   ownerInfo,
 	}
 	c := &Cluster{clusterInfo: clusterInfo, context: &clusterd.Context{Clientset: clientset, Executor: executor},
 		spec: cephv1.ClusterSpec{
@@ -153,4 +155,31 @@ func TestStartSecureDashboard(t *testing.T) {
 	assert.NotNil(t, err)
 	assert.True(t, kerrors.IsNotFound(err))
 	assert.Nil(t, svc)
+}
+
+func TestFileBasedPasswordSupported(t *testing.T) {
+	// for Ceph version Nautilus 14.2.17
+	clusterInfo := &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 14, Minor: 2, Extra: 17}}
+	value := FileBasedPasswordSupported(clusterInfo)
+	assert.True(t, value)
+
+	// for Ceph version Octopus 15.2.10
+	clusterInfo = &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 10}}
+	value = FileBasedPasswordSupported(clusterInfo)
+	assert.True(t, value)
+
+	// for Ceph version Pacific
+	clusterInfo = &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 16, Minor: 0, Extra: 0}}
+	value = FileBasedPasswordSupported(clusterInfo)
+	assert.True(t, value)
+
+	// for Ceph version Quincy
+	clusterInfo = &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 17, Minor: 0, Extra: 0}}
+	value = FileBasedPasswordSupported(clusterInfo)
+	assert.True(t, value)
+
+	// for other Ceph Versions
+	clusterInfo = &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 14, Minor: 2, Extra: 15}}
+	value = FileBasedPasswordSupported(clusterInfo)
+	assert.False(t, value)
 }

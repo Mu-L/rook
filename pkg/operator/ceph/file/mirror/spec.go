@@ -31,8 +31,9 @@ import (
 func (r *ReconcileFilesystemMirror) makeDeployment(daemonConfig *daemonConfig, fsMirror *cephv1.CephFilesystemMirror) (*apps.Deployment, error) {
 	podSpec := v1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:   daemonConfig.ResourceName,
-			Labels: controller.CephDaemonAppLabels(AppName, fsMirror.Namespace, config.FilesystemMirrorType, userID, true),
+			Name:      daemonConfig.ResourceName,
+			Namespace: fsMirror.Namespace,
+			Labels:    controller.CephDaemonAppLabels(AppName, fsMirror.Namespace, config.FilesystemMirrorType, userID, true),
 		},
 		Spec: v1.PodSpec{
 			InitContainers: []v1.Container{
@@ -63,11 +64,11 @@ func (r *ReconcileFilesystemMirror) makeDeployment(daemonConfig *daemonConfig, f
 	if r.cephClusterSpec.Network.IsHost() {
 		podSpec.Spec.DNSPolicy = v1.DNSClusterFirstWithHostNet
 	} else if r.cephClusterSpec.Network.IsMultus() {
-		if err := k8sutil.ApplyMultus(r.cephClusterSpec.Network.NetworkSpec, &podSpec.ObjectMeta); err != nil {
+		if err := k8sutil.ApplyMultus(r.cephClusterSpec.Network, &podSpec.ObjectMeta); err != nil {
 			return nil, err
 		}
 	}
-	fsMirror.Spec.Placement.ApplyToPodSpec(&podSpec.Spec, true)
+	fsMirror.Spec.Placement.ApplyToPodSpec(&podSpec.Spec)
 
 	replicas := int32(1)
 	d := &apps.Deployment{

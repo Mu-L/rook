@@ -166,7 +166,7 @@ func (h *NFSInstaller) UninstallNFSServer(systemNamespace, namespace string) {
 		_, err := h.k8shelper.RookClientset.NfsV1alpha1().NFSServers(namespace).Get(ctx, namespace, metav1.GetOptions{})
 		return err
 	}
-	err = h.k8shelper.WaitForCustomResourceDeletion(namespace, crdCheckerFunc)
+	err = h.k8shelper.WaitForCustomResourceDeletion(namespace, namespace, crdCheckerFunc)
 	checkError(h.T(), err, fmt.Sprintf("failed to wait for crd %s deletion", namespace))
 
 	err = h.k8shelper.DeleteResource("namespace", namespace)
@@ -183,9 +183,9 @@ func (h *NFSInstaller) UninstallNFSServer(systemNamespace, namespace string) {
 	err = DeleteHostPathPVs(h.k8shelper)
 	checkError(h.T(), err, "cannot uninstall hostpath provisioner")
 
-	h.k8shelper.Clientset.RbacV1().ClusterRoleBindings().Delete(ctx, "anon-user-access", metav1.DeleteOptions{})           //nolint, asserting this failing in CI
-	h.k8shelper.Clientset.RbacV1().ClusterRoleBindings().Delete(ctx, "run-nfs-client-provisioner", metav1.DeleteOptions{}) //nolint, asserting this failing in CI
-	h.k8shelper.Clientset.RbacV1().ClusterRoles().Delete(ctx, "nfs-client-provisioner-runner", metav1.DeleteOptions{})     //nolint, asserting this failing in CI
+	h.k8shelper.Clientset.RbacV1().ClusterRoleBindings().Delete(ctx, "anon-user-access", metav1.DeleteOptions{})           //nolint // asserting this failing in CI
+	h.k8shelper.Clientset.RbacV1().ClusterRoleBindings().Delete(ctx, "run-nfs-client-provisioner", metav1.DeleteOptions{}) //nolint // asserting this failing in CI
+	h.k8shelper.Clientset.RbacV1().ClusterRoles().Delete(ctx, "nfs-client-provisioner-runner", metav1.DeleteOptions{})     //nolint // asserting this failing in CI
 	logger.Infof("done removing the operator from namespace %s", systemNamespace)
 }
 

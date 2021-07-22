@@ -29,6 +29,7 @@ import (
 	"github.com/rook/rook/pkg/clusterd"
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
 	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
+	"github.com/rook/rook/pkg/operator/ceph/reporting"
 	cephver "github.com/rook/rook/pkg/operator/ceph/version"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	v1 "k8s.io/api/core/v1"
@@ -37,7 +38,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-const (
+var (
 	// defaultStatusCheckInterval is the interval to check the status of the ceph cluster
 	defaultStatusCheckInterval = 60 * time.Second
 )
@@ -46,7 +47,7 @@ const (
 type cephStatusChecker struct {
 	context     *clusterd.Context
 	clusterInfo *cephclient.ClusterInfo
-	interval    time.Duration
+	interval    *time.Duration
 	client      client.Client
 	isExternal  bool
 }
@@ -56,30 +57,26 @@ func newCephStatusChecker(context *clusterd.Context, clusterInfo *cephclient.Clu
 	c := &cephStatusChecker{
 		context:     context,
 		clusterInfo: clusterInfo,
-		interval:    defaultStatusCheckInterval,
+		interval:    &defaultStatusCheckInterval,
 		client:      context.Client,
 		isExternal:  clusterSpec.External.Enable,
 	}
 
 	// allow overriding the check interval with an env var on the operator
 	// Keep the existing behavior
-	var checkInterval string
+	var checkInterval *time.Duration
 	checkIntervalCRSetting := clusterSpec.HealthCheck.DaemonHealth.Status.Interval
 	checkIntervalEnv := os.Getenv("ROOK_CEPH_STATUS_CHECK_INTERVAL")
 	if checkIntervalEnv != "" {
-		checkInterval = checkIntervalEnv
-	}
-
-	if checkIntervalCRSetting != "" && checkIntervalEnv == "" {
-		checkInterval = checkIntervalCRSetting
-	}
-
-	// Set duration
-	if checkInterval != "" {
-		if duration, err := time.ParseDuration(checkInterval); err == nil {
-			logger.Infof("ceph status check interval is %s", checkInterval)
-			c.interval = duration
+		if duration, err := time.ParseDuration(checkIntervalEnv); err == nil {
+			checkInterval = &duration
 		}
+	} else if checkIntervalCRSetting != nil {
+		checkInterval = &checkIntervalCRSetting.Duration
+	}
+	if checkInterval != nil {
+		logger.Infof("ceph status check interval is %s", checkInterval.String())
+		c.interval = checkInterval
 	}
 
 	return c
@@ -96,7 +93,7 @@ func (c *cephStatusChecker) checkCephStatus(stopCh chan struct{}) {
 			logger.Infof("stopping monitoring of ceph status")
 			return
 
-		case <-time.After(c.interval):
+		case <-time.After(*c.interval):
 			c.checkStatus()
 		}
 	}
@@ -147,10 +144,33 @@ func (c *cephStatusChecker) checkStatus() {
 			logger.Errorf("failed to delete pod on not ready nodes. %v", err)
 		}
 	}
+
+	c.configureHealthSettings(status)
+}
+
+func (c *cephStatusChecker) configureHealthSettings(status cephclient.CephStatus) {
+	// loop through the health codes and log what we find
+	for healthCode, check := range status.Health.Checks {
+		logger.Debugf("Health: %q, code: %q, message: %q", check.Severity, healthCode, check.Summary.Message)
+	}
+
+	// disable the insecure global id if there are no old clients
+	if _, ok := status.Health.Checks["AUTH_INSECURE_GLOBAL_ID_RECLAIM_ALLOWED"]; ok {
+		if _, ok := status.Health.Checks["AUTH_INSECURE_GLOBAL_ID_RECLAIM"]; !ok {
+			logger.Info("Disabling the insecure global ID as no legacy clients are currently connected. If you still require the insecure connections, see the CVE to suppress the health warning and re-enable the insecure connections. https://docs.ceph.com/en/latest/security/CVE-2021-20288/")
+			if _, err := cephclient.SetConfig(c.context, c.clusterInfo, "mon", "auth_allow_insecure_global_id_reclaim", "false", false); err != nil {
+				logger.Warningf("failed to disable the insecure global ID. %v", err)
+			} else {
+				logger.Info("insecure global ID is now disabled")
+			}
+		} else {
+			logger.Warning("insecure clients are connected to the cluster, to resolve the AUTH_INSECURE_GLOBAL_ID_RECLAIM health warning please refer to the upgrade guide to ensure all Ceph daemons are updated.")
+		}
+	}
 }
 
 // updateStatus updates an object with a given status
-func (c *cephStatusChecker) updateCephStatus(status *cephclient.CephStatus, condition cephv1.ConditionType, reason cephv1.ClusterReasonType, message string, conditionStatus v1.ConditionStatus) {
+func (c *cephStatusChecker) updateCephStatus(status *cephclient.CephStatus, condition cephv1.ConditionType, reason cephv1.ConditionReason, message string, conditionStatus v1.ConditionStatus) {
 	clusterName := c.clusterInfo.NamespacedName()
 	cephCluster, err := c.context.RookClientset.CephV1().CephClusters(clusterName.Namespace).Get(context.TODO(), clusterName.Name, metav1.GetOptions{})
 	if err != nil {
@@ -164,6 +184,15 @@ func (c *cephStatusChecker) updateCephStatus(status *cephclient.CephStatus, cond
 
 	// Update with Ceph Status
 	cephCluster.Status.CephStatus = toCustomResourceStatus(cephCluster.Status, status)
+
+	// versions store the ceph version of all the ceph daemons and overall cluster version
+	versions, err := cephclient.GetAllCephDaemonVersions(c.context, c.clusterInfo)
+	if err != nil {
+		logger.Errorf("failed to get ceph daemons versions. %v", err)
+	} else {
+		// Update status with Ceph versions
+		cephCluster.Status.CephStatus.Versions = versions
+	}
 
 	// Update condition
 	logger.Debugf("updating ceph cluster %q status and condition to %+v, %v, %s, %s", clusterName.Namespace, status, conditionStatus, reason, message)
@@ -230,7 +259,7 @@ func (c *ClusterController) updateClusterCephVersion(image string, cephVersion c
 	// update the Ceph version on the retrieved cluster object
 	// do not overwrite the ceph status that is updated in a separate goroutine
 	cephCluster.Status.CephVersion = cephClusterVersion
-	if err := opcontroller.UpdateStatus(c.client, cephCluster); err != nil {
+	if err := reporting.UpdateStatus(c.client, cephCluster); err != nil {
 		logger.Errorf("failed to update cluster %q version. %v", c.namespacedName.Name, err)
 		return
 	}
@@ -287,6 +316,7 @@ func (c *cephStatusChecker) getRookPodsOnNode(node string) ([]v1.Pod, error) {
 		"rook-ceph-crashcollector",
 		"rook-ceph-mgr",
 		"rook-ceph-mds",
+		"rook-ceph-rgw",
 	}
 	podsOnNode := []v1.Pod{}
 	listOpts := metav1.ListOptions{

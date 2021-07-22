@@ -22,7 +22,6 @@ import (
 
 	"github.com/pkg/errors"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
-	"github.com/rook/rook/pkg/daemon/ceph/client"
 	daemonclient "github.com/rook/rook/pkg/daemon/ceph/client"
 	"github.com/rook/rook/pkg/operator/ceph/cluster/mon"
 	"github.com/rook/rook/pkg/operator/ceph/controller"
@@ -72,7 +71,7 @@ func (c *cluster) printOverallCephVersion() {
 
 // This function compare the Ceph spec image and the cluster running version
 // It returns true if the image is different and false if identical
-func diffImageSpecAndClusterRunningVersion(imageSpecVersion cephver.CephVersion, runningVersions client.CephDaemonsVersions) (bool, error) {
+func diffImageSpecAndClusterRunningVersion(imageSpecVersion cephver.CephVersion, runningVersions cephv1.CephDaemonsVersions) (bool, error) {
 	numberOfCephVersions := len(runningVersions.Overall)
 	if numberOfCephVersions == 0 {
 		// let's return immediately
@@ -119,7 +118,7 @@ func diffImageSpecAndClusterRunningVersion(imageSpecVersion cephver.CephVersion,
 func (c *cluster) detectCephVersion(rookImage, cephImage string, timeout time.Duration) (*cephver.CephVersion, error) {
 	logger.Infof("detecting the ceph image version for image %s...", cephImage)
 	versionReporter, err := cmdreporter.New(
-		c.context.Clientset, &c.ownerRef,
+		c.context.Clientset, c.ownerInfo,
 		detectVersionName, detectVersionName, c.Namespace,
 		[]string{"ceph"}, []string{"--version"},
 		rookImage, cephImage)
@@ -131,7 +130,7 @@ func (c *cluster) detectCephVersion(rookImage, cephImage string, timeout time.Du
 	job.Spec.Template.Spec.ServiceAccountName = "rook-ceph-cmd-reporter"
 
 	// Apply the same placement for the ceph version detection as the mon daemons except for PodAntiAffinity
-	cephv1.GetMonPlacement(c.Spec.Placement).ApplyToPodSpec(&job.Spec.Template.Spec, true)
+	cephv1.GetMonPlacement(c.Spec.Placement).ApplyToPodSpec(&job.Spec.Template.Spec)
 	job.Spec.Template.Spec.Affinity.PodAntiAffinity = nil
 
 	stdout, stderr, retcode, err := versionReporter.Run(timeout)
@@ -207,7 +206,7 @@ func (c *cluster) validateCephVersion(version *cephver.CephVersion) error {
 	}
 
 	// Get cluster running versions
-	versions, err := client.GetAllCephDaemonVersions(c.context, c.ClusterInfo)
+	versions, err := daemonclient.GetAllCephDaemonVersions(c.context, c.ClusterInfo)
 	if err != nil {
 		logger.Errorf("failed to get ceph daemons versions, this typically happens during the first cluster initialization. %v", err)
 		return nil
@@ -226,12 +225,12 @@ func (c *cluster) validateCephVersion(version *cephver.CephVersion) error {
 	if differentImages {
 		// If the image version changed let's make sure we can safely upgrade
 		// check ceph's status, if not healthy we fail
-		cephHealthy := client.IsCephHealthy(c.context, c.ClusterInfo)
+		cephHealthy := daemonclient.IsCephHealthy(c.context, c.ClusterInfo)
 		if !cephHealthy {
 			if c.Spec.SkipUpgradeChecks {
 				logger.Warning("ceph is not healthy but SkipUpgradeChecks is set, forcing upgrade.")
 			} else {
-				return errors.Errorf("ceph status in namespace %s is not healthy, refusing to upgrade. fix the cluster and re-edit the cluster CR to trigger a new orchestation update", c.Namespace)
+				return errors.Errorf("ceph status in namespace %s is not healthy, refusing to upgrade. Either fix the health issue or force an update by setting skipUpgradeChecks to true in the cluster CR", c.Namespace)
 			}
 		}
 		// This is an upgrade

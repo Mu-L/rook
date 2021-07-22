@@ -179,7 +179,6 @@ package v1alpha1 // "github.com/rook/rook/pkg/apis/ceph.rook.io/v1alpha1"
 
 import (
   metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-  rook "github.com/rook/rook/pkg/apis/rook.io/v1"
 )
 
 type Cluster struct {
@@ -440,25 +439,4 @@ spec:
           resources:
             requests:
               storage: "1Gi"
-```
-
-`minio-cluster.yaml`:
-
-```yaml
-apiVersion: minio.rook.io/v1alpha1
-kind: ObjectStore
-metadata:
-  name: minio
-  namespace: rook-minio
-spec:
-  mode: distributed
-  accessKey: AKIAIOSFODNN7EXAMPLE
-  secretKey: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
-  network:
-    hostNetwork: false
-  placement:
-  resources:
-  storage:
-    config:
-      nodeCount: 4 # use 4 nodes in the cluster to host storage daemons
 ```

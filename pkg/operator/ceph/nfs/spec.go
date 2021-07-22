@@ -77,7 +77,7 @@ func (r *ReconcileCephNFS) createCephNFSService(nfs *cephv1.CephNFS, cfg daemonC
 	// Set owner ref to the parent object
 	err := controllerutil.SetControllerReference(nfs, s, r.scheme)
 	if err != nil {
-		return errors.Wrap(err, "failed to set owner reference to ceph object store")
+		return errors.Wrapf(err, "failed to set owner reference to ceph nfs %q", s)
 	}
 
 	svc, err := r.context.Clientset.CoreV1().Services(nfs.Namespace).Create(ctx, s, metav1.CreateOptions{})
@@ -138,7 +138,7 @@ func (r *ReconcileCephNFS) makeDeployment(nfs *cephv1.CephNFS, cfg daemonConfig)
 	if r.cephClusterSpec.Network.IsHost() {
 		podSpec.DNSPolicy = v1.DNSClusterFirstWithHostNet
 	}
-	nfs.Spec.Server.Placement.ApplyToPodSpec(&podSpec, true)
+	nfs.Spec.Server.Placement.ApplyToPodSpec(&podSpec)
 
 	podTemplateSpec := v1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
@@ -150,8 +150,8 @@ func (r *ReconcileCephNFS) makeDeployment(nfs *cephv1.CephNFS, cfg daemonConfig)
 
 	if r.cephClusterSpec.Network.IsHost() {
 		podSpec.DNSPolicy = v1.DNSClusterFirstWithHostNet
-	} else if r.cephClusterSpec.Network.NetworkSpec.IsMultus() {
-		if err := k8sutil.ApplyMultus(r.cephClusterSpec.Network.NetworkSpec, &podTemplateSpec.ObjectMeta); err != nil {
+	} else if r.cephClusterSpec.Network.IsMultus() {
+		if err := k8sutil.ApplyMultus(r.cephClusterSpec.Network, &podTemplateSpec.ObjectMeta); err != nil {
 			return nil, err
 		}
 	}

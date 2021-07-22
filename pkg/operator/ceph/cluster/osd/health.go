@@ -26,7 +26,7 @@ import (
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/clusterd"
 	"github.com/rook/rook/pkg/daemon/ceph/client"
-	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
+	"github.com/rook/rook/pkg/operator/ceph/reporting"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 )
@@ -46,7 +46,7 @@ type OSDHealthMonitor struct {
 	context                        *clusterd.Context
 	clusterInfo                    *client.ClusterInfo
 	removeOSDsIfOUTAndSafeToRemove bool
-	interval                       time.Duration
+	interval                       *time.Duration
 }
 
 // NewOSDHealthMonitor instantiates OSD monitoring
@@ -55,16 +55,14 @@ func NewOSDHealthMonitor(context *clusterd.Context, clusterInfo *client.ClusterI
 		context:                        context,
 		clusterInfo:                    clusterInfo,
 		removeOSDsIfOUTAndSafeToRemove: removeOSDsIfOUTAndSafeToRemove,
-		interval:                       defaultHealthCheckInterval,
+		interval:                       &defaultHealthCheckInterval,
 	}
 
 	// allow overriding the check interval
 	checkInterval := healthCheck.DaemonHealth.ObjectStorageDaemon.Interval
-	if checkInterval != "" {
-		if duration, err := time.ParseDuration(checkInterval); err == nil {
-			logger.Infof("ceph osd status in namespace %q check interval %q", h.clusterInfo.Namespace, checkInterval)
-			h.interval = duration
-		}
+	if checkInterval != nil {
+		logger.Infof("ceph osd status in namespace %q check interval %q", h.clusterInfo.Namespace, checkInterval.Duration.String())
+		h.interval = &checkInterval.Duration
 	}
 
 	return h
@@ -75,12 +73,12 @@ func (m *OSDHealthMonitor) Start(stopCh chan struct{}) {
 
 	for {
 		select {
-		case <-time.After(m.interval):
+		case <-time.After(*m.interval):
 			logger.Debug("checking osd processes status.")
 			m.checkOSDHealth()
 
 		case <-stopCh:
-			logger.Infof("Stopping monitoring of OSDs in namespace %s", m.clusterInfo.Namespace)
+			logger.Infof("Stopping monitoring of OSDs in namespace %q", m.clusterInfo.Namespace)
 			return
 		}
 	}
@@ -205,7 +203,7 @@ func (m *OSDHealthMonitor) updateCephStatus(devices []string) {
 	}
 	if !reflect.DeepEqual(cephCluster.Status.CephStorage, &cephClusterStorage) {
 		cephCluster.Status.CephStorage = &cephClusterStorage
-		if err := opcontroller.UpdateStatus(m.context.Client, cephCluster); err != nil {
+		if err := reporting.UpdateStatus(m.context.Client, cephCluster); err != nil {
 			logger.Errorf("failed to update cluster %q Storage. %v", m.clusterInfo.NamespacedName().Name, err)
 			return
 		}

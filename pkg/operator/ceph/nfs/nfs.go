@@ -25,7 +25,6 @@ import (
 	"github.com/pkg/errors"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/clusterd"
-	"github.com/rook/rook/pkg/daemon/ceph/client"
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
 	opmon "github.com/rook/rook/pkg/operator/ceph/cluster/mon"
 	"github.com/rook/rook/pkg/operator/ceph/config"
@@ -87,7 +86,7 @@ func (r *ReconcileCephNFS) upCephNFS(n *cephv1.CephNFS) error {
 		// Set owner ref to cephNFS object
 		err = controllerutil.SetControllerReference(n, deployment, r.scheme)
 		if err != nil {
-			return errors.Wrapf(err, "failed to set owner reference for ceph nfs %q secret", deployment.Name)
+			return errors.Wrapf(err, "failed to set owner reference for ceph nfs deployment %q", deployment.Name)
 		}
 
 		// Set the deployment hash as an annotation
@@ -197,7 +196,7 @@ func (r *ReconcileCephNFS) createConfigMap(n *cephv1.CephNFS, name string) (stri
 	// Set owner reference
 	err := controllerutil.SetControllerReference(n, configMap, r.scheme)
 	if err != nil {
-		return "", errors.Wrapf(err, "failed to set owner reference for ceph nfs %q config map", configMap.Name)
+		return "", errors.Wrapf(err, "failed to set owner reference for ceph ganesha configmap %q", configMap.Name)
 	}
 
 	if _, err := r.context.Clientset.CoreV1().ConfigMaps(n.Namespace).Create(ctx, configMap, metav1.CreateOptions{}); err != nil {
@@ -228,7 +227,7 @@ func (r *ReconcileCephNFS) downCephNFS(n *cephv1.CephNFS, nfsServerListNum int) 
 		logger.Infof("removing deployment %q", depNameToRemove)
 		err := r.context.Clientset.AppsV1().Deployments(n.Namespace).Delete(ctx, depNameToRemove, metav1.DeleteOptions{})
 		if err != nil {
-			if !kerrors.IsAlreadyExists(err) {
+			if !kerrors.IsNotFound(err) {
 				return errors.Wrap(err, "failed to delete ceph nfs deployment")
 			}
 		}
@@ -275,7 +274,7 @@ func validateGanesha(context *clusterd.Context, clusterInfo *cephclient.ClusterI
 	}
 
 	// The existence of the pool provided in n.Spec.RADOS.Pool is necessary otherwise addRADOSConfigFile() will fail
-	_, err := client.GetPoolDetails(context, clusterInfo, n.Spec.RADOS.Pool)
+	_, err := cephclient.GetPoolDetails(context, clusterInfo, n.Spec.RADOS.Pool)
 	if err != nil {
 		return errors.Wrapf(err, "pool %q not found", n.Spec.RADOS.Pool)
 	}

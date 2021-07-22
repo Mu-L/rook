@@ -38,20 +38,20 @@ func TestCephArgs(t *testing.T) {
 	assert.Equal(t, "--name=client.admin", args[3])
 	assert.Equal(t, "--keyring=/etc/a/client.admin.keyring", args[4])
 
-	RunAllCephCommandsInToolbox = true
+	RunAllCephCommandsInToolboxPod = "rook-ceph-tools"
 	args = []string{}
 	command, args = FinalizeCephCommandArgs(CephTool, clusterInfo, args, "/etc")
 	assert.Equal(t, Kubectl, command)
-	assert.Equal(t, 8, len(args), fmt.Sprintf("%+v", args))
+	assert.Equal(t, 10, len(args), fmt.Sprintf("%+v", args))
 	assert.Equal(t, "exec", args[0])
 	assert.Equal(t, "-i", args[1])
 	assert.Equal(t, "rook-ceph-tools", args[2])
 	assert.Equal(t, "-n", args[3])
 	assert.Equal(t, clusterInfo.Namespace, args[4])
 	assert.Equal(t, "--", args[5])
-	assert.Equal(t, CephTool, args[6])
-	assert.Equal(t, "--connect-timeout=15", args[7])
-	RunAllCephCommandsInToolbox = false
+	assert.Equal(t, CephTool, args[8])
+	assert.Equal(t, "--connect-timeout=15", args[9])
+	RunAllCephCommandsInToolboxPod = ""
 
 	// cluster under /var/lib/rook
 	args = []string{"myarg"}
@@ -79,28 +79,6 @@ func TestStretchElectionStrategy(t *testing.T) {
 	clusterInfo := AdminClusterInfo("mycluster")
 
 	err := EnableStretchElectionStrategy(context, clusterInfo)
-	assert.NoError(t, err)
-}
-
-func TestStretchClusterSettings(t *testing.T) {
-	monName := "a"
-	failureDomain := "rack"
-	zone := "rack-x"
-	executor := &exectest.MockExecutor{}
-	executor.MockExecuteCommandWithOutputFile = func(command, outputFile string, args ...string) (string, error) {
-		logger.Infof("Command: %s %v", command, args)
-		switch {
-		case args[0] == "mon" && args[1] == "set_location":
-			assert.Equal(t, monName, args[2])
-			assert.Equal(t, fmt.Sprintf("%s=%s", failureDomain, zone), args[3])
-			return "", nil
-		}
-		return "", errors.Errorf("unexpected ceph command %q", args)
-	}
-	context := &clusterd.Context{Executor: executor}
-	clusterInfo := AdminClusterInfo("mycluster")
-
-	err := SetMonStretchZone(context, clusterInfo, monName, failureDomain, zone)
 	assert.NoError(t, err)
 }
 

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/clusterd"
 	cephver "github.com/rook/rook/pkg/operator/ceph/version"
 	"github.com/rook/rook/pkg/util"
@@ -32,17 +33,6 @@ const (
 	defaultRetryDelay    = 60 * time.Second
 	defaultOSDRetryDelay = 10 * time.Second
 )
-
-// CephDaemonsVersions is a structure that can be used to parsed the output of the 'ceph versions' command
-type CephDaemonsVersions struct {
-	Mon       map[string]int `json:"mon,omitempty"`
-	Mgr       map[string]int `json:"mgr,omitempty"`
-	Osd       map[string]int `json:"osd,omitempty"`
-	Rgw       map[string]int `json:"rgw,omitempty"`
-	Mds       map[string]int `json:"mds,omitempty"`
-	RbdMirror map[string]int `json:"rbd-mirror,omitempty"`
-	Overall   map[string]int `json:"overall,omitempty"`
-}
 
 var (
 	// we don't perform any checks on these daemons
@@ -91,14 +81,14 @@ func GetCephMonVersion(context *clusterd.Context, clusterInfo *ClusterInfo) (*ce
 }
 
 // GetAllCephDaemonVersions reports the Ceph version of each daemon in the cluster
-func GetAllCephDaemonVersions(context *clusterd.Context, clusterInfo *ClusterInfo) (*CephDaemonsVersions, error) {
+func GetAllCephDaemonVersions(context *clusterd.Context, clusterInfo *ClusterInfo) (*cephv1.CephDaemonsVersions, error) {
 	output, err := getAllCephDaemonVersionsString(context, clusterInfo)
 	if err != nil {
 		return nil, err
 	}
 	logger.Debug(output)
 
-	var cephVersionsResult CephDaemonsVersions
+	var cephVersionsResult cephv1.CephDaemonsVersions
 	err = json.Unmarshal([]byte(output), &cephVersionsResult)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to retrieve ceph versions results")
@@ -157,7 +147,7 @@ func OkToStop(context *clusterd.Context, clusterInfo *ClusterInfo, deployment, d
 			// now looping over a single element since we can't address the key directly (we don't know its name)
 			for _, monCount := range versions.Mon {
 				if monCount < 3 {
-					logger.Infof("the cluster has less than 3 monitors, not performing upgrade check, running in best-effort")
+					logger.Infof("the cluster has fewer than 3 monitors, not performing upgrade check, running in best-effort")
 					return nil
 				}
 			}
@@ -284,7 +274,7 @@ func findFSName(deployment string) string {
 	return strings.TrimPrefix(deployment, "rook-ceph-mds-")
 }
 
-func daemonMapEntry(versions *CephDaemonsVersions, daemonType string) (map[string]int, error) {
+func daemonMapEntry(versions *cephv1.CephDaemonsVersions, daemonType string) (map[string]int, error) {
 	switch daemonType {
 	case "mon":
 		return versions.Mon, nil
@@ -356,6 +346,40 @@ func buildHostListFromTree(tree OsdTree) (OsdTree, error) {
 	return osdList, nil
 }
 
+// OSDUpdateShouldCheckOkToStop returns true if Rook should check ok-to-stop for OSDs when doing
+// OSD daemon updates. It will return false if it should not perform ok-to-stop checks, for example,
+// when there are fewer than 3 OSDs
+func OSDUpdateShouldCheckOkToStop(context *clusterd.Context, clusterInfo *ClusterInfo) bool {
+	userIntervention := "the user will likely need to set continueUpgradeAfterChecksEvenIfNotHealthy to allow OSD updates to proceed"
+
+	osds, err := OsdListNum(context, clusterInfo)
+	if err != nil {
+		// If calling osd list fails, we assume there are more than 3 OSDs and we check if ok-to-stop
+		// If there are less than 3 OSDs, the ok-to-stop call will fail
+		// this can still be controlled by setting continueUpgradeAfterChecksEvenIfNotHealthy
+		// At least this will happen for a single OSD only, which means 2 OSDs will restart in a small interval
+		logger.Warningf("failed to determine the total number of osds. will check if OSDs are ok-to-stop. if there are fewer than 3 OSDs %s. %v", userIntervention, err)
+		return true
+	}
+	if len(osds) < 3 {
+		logger.Warningf("the cluster has fewer than 3 osds. not performing upgrade check. running in best-effort")
+		return false
+	}
+
+	// aio means all in one
+	aio, err := allOSDsSameHost(context, clusterInfo)
+	if err != nil {
+		logger.Warningf("failed to determine if all osds are running on the same host. will check if OSDs are ok-to-stop. if all OSDs are running on one host %s. %v", userIntervention, err)
+		return true
+	}
+	if aio {
+		logger.Warningf("all OSDs are running on the same host. not performing upgrade check. running in best-effort")
+		return false
+	}
+
+	return true
+}
+
 // osdDoNothing determines whether we should perform upgrade pre-check and post-checks for the OSD daemon
 // it checks for various cluster info like number of OSD and their placement
 // it returns 'true' if we need to do nothing and false and we should pre-check/post-check
@@ -370,14 +394,13 @@ func osdDoNothing(context *clusterd.Context, clusterInfo *ClusterInfo) bool {
 		return false
 	}
 	if len(osds) < 3 {
-		logger.Warningf("the cluster has less than 3 osds, not performing upgrade check, running in best-effort")
+		logger.Warningf("the cluster has fewer than 3 osds, not performing upgrade check, running in best-effort")
 		return true
 	}
 
 	// aio means all in one
 	aio, err := allOSDsSameHost(context, clusterInfo)
 	if err != nil {
-		// If calling osd list fails, we assume there are more than 3 OSDs and we check if ok-to-stop
 		logger.Warningf("failed to determine if all osds are running on the same host, performing upgrade check anyways. %v", err)
 		return false
 	}

@@ -40,11 +40,21 @@ const (
 	// UninitializedCephConfigError refers to the error message printed by the Ceph CLI when there is no ceph configuration file
 	// This typically is raised when the operator has not finished initializing
 	UninitializedCephConfigError = "error calling conf_read_file"
+
+	// OperatorNotInitializedMessage is the message we print when the Operator is not ready to reconcile, typically the ceph.conf has not been generated yet
+	OperatorNotInitializedMessage = "skipping reconcile since operator is still initializing"
+
+	// CancellingOrchestrationMessage is the message to indicate a reconcile was cancelled
+	CancellingOrchestrationMessage = "CANCELLING CURRENT ORCHESTRATION"
 )
 
 var (
 	// ImmediateRetryResult Return this for a immediate retry of the reconciliation loop with the same request object.
 	ImmediateRetryResult = reconcile.Result{Requeue: true}
+
+	// ImmediateRetryResultNoBackoff Return this for a immediate retry of the reconciliation loop with the same request object.
+	// Override the exponential backoff behavior by setting the RequeueAfter time explicitly.
+	ImmediateRetryResultNoBackoff = reconcile.Result{Requeue: true, RequeueAfter: time.Second}
 
 	// WaitForRequeueIfCephClusterNotReady waits for the CephCluster to be ready
 	WaitForRequeueIfCephClusterNotReady = reconcile.Result{Requeue: true, RequeueAfter: 10 * time.Second}
@@ -59,13 +69,25 @@ var (
 	OperatorCephBaseImageVersion string
 )
 
+func FlexDriverEnabled(context *clusterd.Context) bool {
+	// Ignore the error. In the remote chance that the configmap fails to be read, we will default to disabling the flex driver
+	value, _ := k8sutil.GetOperatorSetting(context.Clientset, OperatorSettingConfigMapName, "ROOK_ENABLE_FLEX_DRIVER", "false")
+	return value == "true"
+}
+
+func DiscoveryDaemonEnabled(context *clusterd.Context) bool {
+	// Ignore the error. In the remote chance that the configmap fails to be read, we will default to disabling the discovery daemon
+	value, _ := k8sutil.GetOperatorSetting(context.Clientset, OperatorSettingConfigMapName, "ROOK_ENABLE_DISCOVERY_DAEMON", "false")
+	return value == "true"
+}
+
 // CheckForCancelledOrchestration checks whether a cancellation has been requested
 func CheckForCancelledOrchestration(context *clusterd.Context) error {
 	defer context.RequestCancelOrchestration.UnSet()
 
 	// Check whether we need to cancel the orchestration
 	if context.RequestCancelOrchestration.IsSet() {
-		return errors.New("CANCELLING CURRENT ORCHESTRATION")
+		return errors.New(CancellingOrchestrationMessage)
 	}
 
 	return nil
@@ -85,7 +107,7 @@ func canIgnoreHealthErrStatusInReconcile(cephCluster cephv1.CephCluster, control
 	var allowedErrStatus = []string{"MDS_ALL_DOWN"}
 	var ignoreHealthErr = len(healthErrKeys) == 1 && contains(allowedErrStatus, healthErrKeys[0])
 	if ignoreHealthErr {
-		logger.Debugf("%q: ignoring ceph status %q because only cause is %q (full status is %q)", controllerName, cephCluster.Status.CephStatus.Health, healthErrKeys[0], cephCluster.Status.CephStatus)
+		logger.Debugf("%q: ignoring ceph status %q because only cause is %q (full status is %+v)", controllerName, cephCluster.Status.CephStatus.Health, healthErrKeys[0], cephCluster.Status.CephStatus)
 	}
 	return ignoreHealthErr
 }
@@ -126,22 +148,25 @@ func IsReadyToReconcile(c client.Client, clustercontext *clusterd.Context, names
 		if ok && len(details) == 1 && strings.Contains(message.Message, "Error initializing cluster client") {
 			logger.Infof("%s: skipping reconcile since operator is still initializing", controllerName)
 		} else {
-			logger.Infof("%s: CephCluster %q found but skipping reconcile since ceph health is %q", controllerName, cephCluster.Name, cephCluster.Status.CephStatus)
+			logger.Infof("%s: CephCluster %q found but skipping reconcile since ceph health is %+v", controllerName, cephCluster.Name, cephCluster.Status.CephStatus)
 		}
 	}
 
+	logger.Debugf("%q: CephCluster %q initial reconcile is not complete yet...", controllerName, namespacedName.Namespace)
 	return cephCluster, false, cephClusterExists, WaitForRequeueIfCephClusterNotReady
 }
 
 // ClusterOwnerRef represents the owner reference of the CephCluster CR
 func ClusterOwnerRef(clusterName, clusterID string) metav1.OwnerReference {
 	blockOwner := true
+	controller := true
 	return metav1.OwnerReference{
 		APIVersion:         fmt.Sprintf("%s/%s", ClusterResource.Group, ClusterResource.Version),
 		Kind:               ClusterResource.Kind,
 		Name:               clusterName,
 		UID:                types.UID(clusterID),
 		BlockOwnerDeletion: &blockOwner,
+		Controller:         &controller,
 	}
 }
 

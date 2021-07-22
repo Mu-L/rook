@@ -18,13 +18,15 @@ include ../image.mk
 # Image Build Options
 
 ifeq ($(GOARCH),amd64)
-CEPH_VERSION = v15.2.9-20210224
+CEPH_VERSION = v16.2.5-20210708
 else
-CEPH_VERSION = v15.2.9-20210224
+CEPH_VERSION = v16.2.5-20210708
 endif
 BASEIMAGE = ceph/ceph-$(GOARCH):$(CEPH_VERSION)
 CEPH_IMAGE = $(BUILD_REGISTRY)/ceph-$(GOARCH)
 OPERATOR_SDK_VERSION = v0.17.1
+# TODO: update to yq v4 - v3 end of life in Aug 2021 ; v4 removes the 'yq delete' cmd and changes syntax
+YQ_VERSION = 3.3.0
 GOHOST := GOOS=$(GOHOSTOS) GOARCH=$(GOHOSTARCH) go
 
 TEMP := $(shell mktemp -d)
@@ -33,9 +35,19 @@ ifeq ($(HOST_PLATFORM),linux_amd64)
 OPERATOR_SDK_PLATFORM = x86_64-linux-gnu
 INCLUDE_CSV_TEMPLATES = true
 endif
+ifeq ($(HOST_PLATFORM),darwin_amd64)
+OPERATOR_SDK_PLATFORM = x86_64-apple-darwin
+INCLUDE_CSV_TEMPLATES = true
+endif
+ifneq ($(INCLUDE_CSV_TEMPLATES),true)
+$(info )
+$(info NOT INCLUDING OLM/CSV TEMPLATES!)
+$(info )
+endif
 
 OPERATOR_SDK := $(TOOLS_HOST_DIR)/operator-sdk-$(OPERATOR_SDK_VERSION)
-YQ := $(TOOLS_HOST_DIR)/yq
+YQ := $(TOOLS_HOST_DIR)/yq-$(YQ_VERSION)
+export OPERATOR_SDK YQ
 
 # ====================================================================================
 # Build Rook
@@ -58,27 +70,51 @@ do.build: generate-csv-ceph-templates
 		mkdir $(TEMP)/ceph-csv-templates;\
 	fi
 	@cd $(TEMP) && $(SED_CMD) 's|BASEIMAGE|$(BASEIMAGE)|g' Dockerfile
-	@$(DOCKERCMD) build $(BUILD_ARGS) \
+	@if [ -z "$(BUILD_CONTAINER_IMAGE)" ]; then\
+		$(DOCKERCMD) build $(BUILD_ARGS) \
 		--build-arg ARCH=$(GOARCH) \
 		--build-arg TINI_VERSION=$(TINI_VERSION) \
 		-t $(CEPH_IMAGE) \
-		$(TEMP)
+		$(TEMP);\
+	fi
 	@rm -fr $(TEMP)
+	@$(MAKE) -C ../.. crds # revert changes made to the crds.yaml file during the csv-gen sequence
 
 generate-csv-ceph-templates: $(OPERATOR_SDK) $(YQ)
 	@if [ ! "$(INCLUDE_CSV_TEMPLATES)" = "" ]; then\
-		OPERATOR_SDK=$(OPERATOR_SDK) YQ_TOOL=$(YQ) ../../cluster/olm/ceph/generate-rook-csv-templates.sh;\
+		if [ "$(GOARCH)" = amd64 ]; then\
+			BEFORE_GEN_CRD_SIZE=$$(wc -l < ../../cluster/examples/kubernetes/ceph/crds.yaml);\
+			$(MAKE) -C ../.. NO_OB_OBC_VOL_GEN=true MAX_DESC_LEN=0 crds;\
+			AFTER_GEN_CRD_SIZE=$$(wc -l < ../../cluster/examples/kubernetes/ceph/crds.yaml);\
+			if [ "$$BEFORE_GEN_CRD_SIZE" -le "$$AFTER_GEN_CRD_SIZE" ]; then\
+				echo "the new crd file must be smaller since the description fields were stripped!";\
+				echo "length before $$BEFORE_GEN_CRD_SIZE";\
+				echo "length after $$AFTER_GEN_CRD_SIZE";\
+				exit 1;\
+			fi;\
+		fi;\
+		../../cluster/olm/ceph/generate-rook-csv-templates.sh;\
 	fi
 
 $(YQ):
 	@if [ ! "$(INCLUDE_CSV_TEMPLATES)" = "" ]; then\
 		echo === installing yq $(GOHOST);\
-		curl -JL https://github.com/mikefarah/yq/releases/download/3.3.0/yq_$(HOST_PLATFORM) -o $(YQ);\
+		mkdir -p $(TOOLS_HOST_DIR);\
+		curl -JL https://github.com/mikefarah/yq/releases/download/$(YQ_VERSION)/yq_$(HOST_PLATFORM) -o $(YQ);\
 		chmod +x $(YQ);\
 	fi
 
 $(OPERATOR_SDK):
 	@if [ ! "$(INCLUDE_CSV_TEMPLATES)" = "" ]; then\
+		echo === installing operator-sdk $(GOHOST);\
+		mkdir -p $(TOOLS_HOST_DIR);\
 		curl -JL https://github.com/operator-framework/operator-sdk/releases/download/$(OPERATOR_SDK_VERSION)/operator-sdk-$(OPERATOR_SDK_VERSION)-$(OPERATOR_SDK_PLATFORM) -o $(TOOLS_HOST_DIR)/operator-sdk-$(OPERATOR_SDK_VERSION);\
 		chmod +x $(OPERATOR_SDK);\
-        fi
+	fi
+
+csv: $(OPERATOR_SDK) $(YQ) ## Generate a CSV file for OLM.
+	@echo Generating CSV manifests
+	@cd ../.. && cluster/olm/ceph/generate-rook-csv.sh $(CSV_VERSION) $(CSV_PLATFORM) $(ROOK_OP_VERSION)
+
+csv-clean: $(OPERATOR_SDK) $(YQ) ## Remove existing OLM files.
+	@rm -fr ../../cluster/olm/ceph/deploy/* ../../cluster/olm/ceph/templates/*

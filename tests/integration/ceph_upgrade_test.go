@@ -58,7 +58,7 @@ func TestCephUpgradeSuite(t *testing.T) {
 
 	s := new(UpgradeSuite)
 	defer func(s *UpgradeSuite) {
-		HandlePanics(recover(), s.op, s.T)
+		HandlePanics(recover(), s.TearDownSuite, s.T)
 	}(s)
 	suite.Run(t, s)
 }
@@ -66,40 +66,37 @@ func TestCephUpgradeSuite(t *testing.T) {
 type UpgradeSuite struct {
 	suite.Suite
 	helper    *clients.TestClient
-	op        *TestCluster
 	k8sh      *utils.K8sHelper
+	settings  *installer.TestCephSettings
+	installer *installer.CephInstaller
 	namespace string
 }
 
 func (s *UpgradeSuite) SetupSuite() {
 	s.namespace = "upgrade-ns"
-	upgradeTestCluster := TestCluster{
-		clusterName:             s.namespace,
-		namespace:               s.namespace,
-		storeType:               "",
-		storageClassName:        "",
-		useHelm:                 false,
-		usePVC:                  false,
-		mons:                    1,
-		rbdMirrorWorkers:        0,
-		rookCephCleanup:         false,
-		skipOSDCreation:         false,
-		minimalMatrixK8sVersion: upgradeMinimalTestVersion,
-		rookVersion:             installer.Version1_5,
-		cephVersion:             installer.NautilusVersion,
+	s.settings = &installer.TestCephSettings{
+		ClusterName:       s.namespace,
+		Namespace:         s.namespace,
+		OperatorNamespace: installer.SystemNamespace(s.namespace),
+		StorageClassName:  "",
+		UseHelm:           false,
+		UsePVC:            false,
+		Mons:              1,
+		UseCSI:            true,
+		SkipOSDCreation:   false,
+		RookVersion:       installer.Version1_6,
+		CephVersion:       installer.NautilusPartitionVersion,
 	}
 
-	s.op, s.k8sh = StartTestCluster(s.T, &upgradeTestCluster)
-	s.helper = clients.CreateTestClient(s.k8sh, s.op.installer.Manifests)
+	s.installer, s.k8sh = StartTestCluster(s.T, s.settings, upgradeMinimalTestVersion)
+	s.helper = clients.CreateTestClient(s.k8sh, s.installer.Manifests)
 }
 
 func (s *UpgradeSuite) TearDownSuite() {
-	s.op.Teardown()
+	s.installer.UninstallRook()
 }
 
 func (s *UpgradeSuite) TestUpgradeToMaster() {
-	systemNamespace := installer.SystemNamespace(s.namespace)
-
 	//
 	// Create block, object, and file storage before the upgrade
 	//
@@ -108,7 +105,7 @@ func (s *UpgradeSuite) TestUpgradeToMaster() {
 	blockName := "block-claim-upgrade"
 	logger.Infof("Initializing block before the upgrade")
 	clusterInfo := client.AdminClusterInfo(s.namespace)
-	setupBlockLite(s.helper, s.k8sh, s.Suite, clusterInfo, systemNamespace, poolName, storageClassName, blockName, rbdPodName, s.op.installer.CephVersion)
+	setupBlockLite(s.helper, s.k8sh, s.Suite, clusterInfo, poolName, storageClassName, blockName, rbdPodName)
 
 	createPodWithBlock(s.helper, s.k8sh, s.Suite, s.namespace, storageClassName, rbdPodName, blockName)
 
@@ -121,13 +118,12 @@ func (s *UpgradeSuite) TestUpgradeToMaster() {
 	logger.Infof("Initializing file before the upgrade")
 	filesystemName := "upgrade-test-fs"
 	activeCount := 1
-	createFilesystem(s.helper, s.k8sh, s.Suite, s.namespace, filesystemName, activeCount)
+	createFilesystem(s.helper, s.k8sh, s.Suite, s.settings, filesystemName, activeCount)
 
 	// Start the file test client
 	fsStorageClass := "file-upgrade"
-	assert.NoError(s.T(), s.helper.FSClient.CreateStorageClass(filesystemName, systemNamespace, s.namespace, fsStorageClass))
-	useCSI := true
-	createFilesystemConsumerPod(s.helper, s.k8sh, s.Suite, s.namespace, filesystemName, fsStorageClass, useCSI)
+	assert.NoError(s.T(), s.helper.FSClient.CreateStorageClass(filesystemName, s.settings.OperatorNamespace, s.namespace, fsStorageClass))
+	createFilesystemConsumerPod(s.helper, s.k8sh, s.Suite, s.settings, filesystemName, fsStorageClass)
 	defer func() {
 		cleanupFilesystemConsumer(s.helper, s.k8sh, s.Suite, s.namespace, filePodName)
 		cleanupFilesystem(s.helper, s.k8sh, s.Suite, s.namespace, filesystemName)
@@ -135,7 +131,11 @@ func (s *UpgradeSuite) TestUpgradeToMaster() {
 
 	logger.Infof("Initializing object before the upgrade")
 	objectStoreName := "upgraded-object"
-	runObjectE2ETestLite(s.helper, s.k8sh, s.Suite, s.namespace, objectStoreName, 1, false)
+	runObjectE2ETestLite(s.helper, s.k8sh, s.Suite, s.settings, objectStoreName, 1, false)
+
+	logger.Infof("Initializing object user before the upgrade")
+	objectUserID := "upgraded-user"
+	createCephObjectUser(s.Suite, s.helper, s.k8sh, s.namespace, objectStoreName, objectUserID, false)
 
 	logger.Info("Initializing object bucket claim before the upgrade")
 	bucketStorageClassName := "rook-smoke-delete-bucket"
@@ -145,8 +145,10 @@ func (s *UpgradeSuite) TestUpgradeToMaster() {
 	cobcErr := s.helper.BucketClient.CreateObc(obcName, bucketStorageClassName, bucketPrefix, maxObject, false)
 	require.Nil(s.T(), cobcErr)
 	defer func() {
+		_ = s.helper.ObjectUserClient.Delete(s.namespace, objectUserID)
 		_ = s.helper.BucketClient.DeleteObc(obcName, bucketStorageClassName, bucketPrefix, maxObject, false)
 		_ = s.helper.BucketClient.DeleteBucketStorageClass(s.namespace, objectStoreName, bucketStorageClassName, "Delete", region)
+		objectStoreCleanUp(s.Suite, s.helper, s.k8sh, s.settings.Namespace, objectStoreName)
 	}()
 
 	created := utils.Retry(12, 2*time.Second, "OBC is created", func() bool {
@@ -156,7 +158,7 @@ func (s *UpgradeSuite) TestUpgradeToMaster() {
 	require.True(s.T(), created)
 
 	// verify that we're actually running the right pre-upgrade image
-	s.verifyOperatorImage(installer.Version1_5)
+	s.verifyOperatorImage(installer.Version1_6)
 
 	message := "my simple message"
 	preFilename := "pre-upgrade-file"
@@ -175,36 +177,56 @@ func (s *UpgradeSuite) TestUpgradeToMaster() {
 	require.NotEqual(s.T(), 0, numOSDs)
 
 	//
-	// Upgrade Rook from v1.4 to master
+	// Upgrade Rook from v1.6 to master
 	//
-	logger.Infof("*** UPGRADING ROOK FROM %s to master ***", installer.Version1_5)
-	s.gatherLogs(systemNamespace, "_before_master_upgrade")
+	logger.Infof("*** UPGRADING ROOK FROM %s to master ***", installer.Version1_6)
+	s.gatherLogs(s.settings.OperatorNamespace, "_before_master_upgrade")
 	s.upgradeToMaster()
 
 	s.verifyOperatorImage(installer.VersionMaster)
 	s.verifyRookUpgrade(numOSDs)
-	logger.Infof("Done with automatic upgrade from %s to master", installer.Version1_5)
-	newFile := "post-upgrade-1_5-to-master-file"
+	err = s.installer.WaitForToolbox(s.namespace)
+	assert.NoError(s.T(), err)
+
+	logger.Infof("Done with automatic upgrade from %s to master", installer.Version1_6)
+	newFile := "post-upgrade-1_6-to-master-file"
 	s.verifyFilesAfterUpgrade(filesystemName, newFile, message, rbdFilesToRead, cephfsFilesToRead)
 	rbdFilesToRead = append(rbdFilesToRead, newFile)
 	cephfsFilesToRead = append(cephfsFilesToRead, newFile)
 
-	// should be Bound after upgrade to Rook v1.5+
-	// do not need retry b/c the OBC controller runs parallel to Rook-Ceph orchestration
-	require.True(s.T(), s.helper.BucketClient.CheckOBC(obcName, "bound"))
+	checkCephObjectUser(s.Suite, s.helper, s.k8sh, s.namespace, objectStoreName, objectUserID, true)
 
-	logger.Infof("Verified upgrade from %s to master", installer.Version1_5)
+	// should be Bound after upgrade to Rook master
+	// do not need retry b/c the OBC controller runs parallel to Rook-Ceph orchestration
+	assert.True(s.T(), s.helper.BucketClient.CheckOBC(obcName, "bound"))
+
+	logger.Infof("Verified upgrade from %s to master", installer.Version1_6)
 
 	//
 	// Upgrade from nautilus to octopus
 	//
 	logger.Infof("*** UPGRADING CEPH FROM Nautilus TO Octopus ***")
-	s.gatherLogs(systemNamespace, "_before_octopus_upgrade")
+	s.gatherLogs(s.settings.OperatorNamespace, "_before_octopus_upgrade")
 	s.upgradeCephVersion(installer.OctopusVersion.Image, numOSDs)
 	// Verify reading and writing to the test clients
 	newFile = "post-octopus-upgrade-file"
 	s.verifyFilesAfterUpgrade(filesystemName, newFile, message, rbdFilesToRead, cephfsFilesToRead)
 	logger.Infof("Verified upgrade from nautilus to octopus")
+
+	checkCephObjectUser(s.Suite, s.helper, s.k8sh, s.namespace, objectStoreName, objectUserID, true)
+
+	//
+	// Upgrade from octopus to pacific
+	//
+	logger.Infof("*** UPGRADING CEPH FROM OCTOPUS TO PACIFIC ***")
+	s.gatherLogs(s.settings.OperatorNamespace, "_before_pacific_upgrade")
+	s.upgradeCephVersion(installer.PacificVersion.Image, numOSDs)
+	// Verify reading and writing to the test clients
+	newFile = "post-pacific-upgrade-file"
+	s.verifyFilesAfterUpgrade(filesystemName, newFile, message, rbdFilesToRead, cephfsFilesToRead)
+	logger.Infof("Verified upgrade from octopus to pacific")
+
+	checkCephObjectUser(s.Suite, s.helper, s.k8sh, s.namespace, objectStoreName, objectUserID, true)
 }
 
 func (s *UpgradeSuite) gatherLogs(systemNamespace, testSuffix string) {
@@ -213,7 +235,7 @@ func (s *UpgradeSuite) gatherLogs(systemNamespace, testSuffix string) {
 		s.k8sh.PrintPodDescribe(s.namespace)
 	}
 	n := strings.Replace(s.T().Name(), "/", "_", -1) + testSuffix
-	s.op.installer.GatherAllRookLogs(n, systemNamespace, s.namespace)
+	s.installer.GatherAllRookLogs(n, systemNamespace, s.namespace)
 }
 
 func (s *UpgradeSuite) upgradeCephVersion(newCephImage string, numOSDs int) {
@@ -241,7 +263,7 @@ func (s *UpgradeSuite) verifyRookUpgrade(numOSDs int) {
 	// Get some info about the currently deployed mons to determine later if they are all updated
 	monDepList, err := k8sutil.GetDeployments(s.k8sh.Clientset, s.namespace, "app=rook-ceph-mon")
 	require.NoError(s.T(), err)
-	require.Equal(s.T(), s.op.mons, len(monDepList.Items), monDepList.Items)
+	require.Equal(s.T(), s.settings.Mons, len(monDepList.Items), monDepList.Items)
 
 	// Get some info about the currently deployed mgr to determine later if it is updated
 	mgrDepList, err := k8sutil.GetDeployments(s.k8sh.Clientset, s.namespace, "app=rook-ceph-mgr")
@@ -263,7 +285,7 @@ func (s *UpgradeSuite) verifyRookUpgrade(numOSDs int) {
 func (s *UpgradeSuite) waitForUpgradedDaemons(previousVersion, versionLabel string, numOSDs int, waitForMDS bool) {
 	// wait for the mon(s) to be updated
 	monsNotOldVersion := fmt.Sprintf("app=rook-ceph-mon,%s!=%s", versionLabel, previousVersion)
-	err := s.k8sh.WaitForDeploymentCount(monsNotOldVersion, s.namespace, s.op.mons)
+	err := s.k8sh.WaitForDeploymentCount(monsNotOldVersion, s.namespace, s.settings.Mons)
 	require.NoError(s.T(), err, "mon(s) didn't update")
 	err = s.k8sh.WaitForLabeledDeploymentsToBeReady(monsNotOldVersion, s.namespace)
 	require.NoError(s.T(), err)
@@ -336,19 +358,16 @@ func (s *UpgradeSuite) verifyFilesAfterUpgrade(fsName, newFileToWrite, messageFo
 // UpgradeToMaster performs the steps necessary to upgrade a Rook v1.4 cluster to master. It does not
 // verify the upgrade but merely starts the upgrade process.
 func (s *UpgradeSuite) upgradeToMaster() {
-	v1ExtensionsSupported := false
-	if s.k8sh.VersionAtLeast("v1.16.0") {
-		v1ExtensionsSupported = true
-	}
-	require.NoError(s.T(), s.k8sh.ResourceOperation("apply", upgradeManifestToMaster(s.namespace, v1ExtensionsSupported)))
+	// Apply the CRDs for the latest master
+	s.settings.RookVersion = installer.VersionMaster
+	m := installer.NewCephManifests(s.settings)
+	require.NoError(s.T(), s.k8sh.ResourceOperation("apply", m.GetCRDs(s.k8sh)))
+
+	require.NoError(s.T(), s.k8sh.ResourceOperation("apply", m.GetCommon()))
 
 	require.NoError(s.T(),
-		s.k8sh.SetDeploymentVersion(installer.SystemNamespace(s.namespace), operatorContainer, operatorContainer, installer.VersionMaster))
-}
+		s.k8sh.SetDeploymentVersion(s.settings.OperatorNamespace, operatorContainer, operatorContainer, installer.VersionMaster))
 
-func upgradeManifestToMaster(namespace string, useV1Extensions bool) string {
-	// Always apply CRDs for the latest master
-	m := installer.NewCephManifests(installer.VersionMaster)
-	manifests := m.GetRookCRDs(useV1Extensions)
-	return manifests
+	require.NoError(s.T(),
+		s.k8sh.SetDeploymentVersion(s.settings.Namespace, "rook-ceph-tools", "rook-ceph-tools", installer.VersionMaster))
 }
